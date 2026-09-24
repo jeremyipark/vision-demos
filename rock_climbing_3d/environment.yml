@@ -1,0 +1,21 @@
+# conda env create -f environment.yml && conda activate rock_climbing_3d
+#
+# HDR clips need a Vulkan device for libplacebo to tone-map on. That driver is
+# deliberately not in this cross-platform file: macOS users can add
+# `conda install -c conda-forge moltenvk`; other systems use their own driver.
+name: rock_climbing_3d
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - py-opencv          # SIFT + USAC_MAGSAC: the camera track rests on both
+  - numpy
+  - scipy              # mask cleanup, the route spline, keypoint smoothing
+  - matplotlib-base
+  - pillow
+  - rich
+  - python-dotenv
+  - pip
+  - pip:
+      - openai>=1.40

@@ -1,0 +1,20 @@
+# Project-specific rules only. Secrets, Python and OS noise are handled once at
+# the repo root; these paths are relative to this file, so they scope cleanly to
+# rock_climbing_3d/ and cannot reach another project's `data/`.
+
+# ── Media and run artifacts ──────────────────────────────────────────────────
+# No videos live in the repo. `data/input/current/` is where you drop your
+# clips, `data/cache/` holds converted MP4s and cached gateway responses, and
+# `data/output/` gets one timestamped directory per run. All of it is local.
+#
+# Ignored as a blanket rather than per subdirectory, so a clip dropped straight
+# into `data/` cannot be committed either. Git does not descend into an ignored
+# directory, which is why each level has to be re-admitted before its own
+# contents can be excluded and its `.gitkeep` let back in.
+data/*
+!data/input/
+data/input/*
+!data/input/.gitkeep
+!data/input/current/
+data/input/current/*
+!data/input/current/.gitkeep
