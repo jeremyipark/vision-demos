@@ -142,6 +142,10 @@ WALL_MAX_SAMPLES = 160    # …capped here; the whole stack is held to take a me
 WALL_SCALE = 1.0          # canvas pixels per canvas pixel, for a finer mosaic
 WALL_SHARPNESS_WEIGHT = True   # favour the frames that resolved each pixel best
 WALL_MIN_COVERAGE = 3     # canvas seen by fewer frames than this is cropped away
+# Ceiling on the frame stack the median is taken over. A normal clip is well
+# under it (~1.1 GB for a 43 s handheld take); a pan wide enough to blow the
+# canvas up takes fewer frames instead of running the machine out of memory.
+WALL_MEMORY_MB = 1500
 
 # ── Gateway ──────────────────────────────────────────────────────────────────
 GATEWAY_BASE_URL = "https://gateway.vlm.run/v1/openai"

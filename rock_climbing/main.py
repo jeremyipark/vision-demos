@@ -313,7 +313,8 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     rule(5, "The wall, from every frame at once")
     wall_settings = {"stride": cfg.WALL_STRIDE, "max": cfg.WALL_MAX_SAMPLES,
                      "scale": cfg.WALL_SCALE, "sharp": cfg.WALL_SHARPNESS_WEIGHT,
-                     "coverage": cfg.WALL_MIN_COVERAGE, "camera": camera_settings}
+                     "coverage": cfg.WALL_MIN_COVERAGE, "memory": cfg.WALL_MEMORY_MB,
+                     "camera": camera_settings}
     wall_cache = cfg.CACHE_DIR / (camera_mod.cache_path(
         mp4, cfg.CACHE_DIR, settings=wall_settings).stem.replace("camera.", "wall.") + ".png")
     wall_seconds = 0.0
@@ -328,7 +329,8 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
         wall, coverage = mosaic.build(
             mp4, track, stride=cfg.WALL_STRIDE, scale=cfg.WALL_SCALE,
             max_samples=cfg.WALL_MAX_SAMPLES,
-            sharpness_weight=cfg.WALL_SHARPNESS_WEIGHT, console=console)
+            sharpness_weight=cfg.WALL_SHARPNESS_WEIGHT,
+            memory_mb=cfg.WALL_MEMORY_MB, console=console)
         wall, coverage, crop_box = mosaic.trim(wall, coverage,
                                                min_frames=cfg.WALL_MIN_COVERAGE)
         wall_seconds = time.perf_counter() - t0

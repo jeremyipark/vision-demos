@@ -77,6 +77,7 @@ def _local_scale(matrix: np.ndarray, size: tuple[int, int]) -> np.ndarray:
 
 def build(video: Path, track: Track, *, stride: int = 4, scale: float = 1.0,
           max_samples: int = 220, sharpness_weight: bool = True,
+          memory_mb: float | None = 1500.0,
           console=None) -> tuple[np.ndarray, np.ndarray]:
     """Warp the clip onto the canvas and reduce it. ``(wall_bgr, coverage)``.
 
@@ -86,14 +87,32 @@ def build(video: Path, track: Track, *, stride: int = 4, scale: float = 1.0,
     pointed at.
 
     Held in memory as a stack so the median is a median and not a running
-    approximation of one, which is why ``max_samples`` exists. At the default
-    canvas scale that stack is a few GB at 220 frames and considerably more at
-    600, and 220 evenly-spaced looks at a static wall is already far past the
-    point where another one changes a pixel.
+    approximation of one — but held as the frames' own bytes, with a separate
+    mask for which pixels each frame saw, rather than as float32 with NaN in the
+    gaps. The warp returns uint8, so this loses nothing, and it is a quarter of
+    the size. The reduction then happens a strip of rows at a time
+    (`_reduce`), so no float copy of the whole stack ever exists. On a 43 s
+    handheld clip that took the peak from 7.0 GB to 1.7 GB with a bit-identical
+    wall.
+
+    *memory_mb* bounds the stack itself (frames, masks and weights). A wide pan
+    can grow the canvas several frames across, and past that point fewer, more
+    widely spaced looks are taken rather than running the machine out of
+    memory: a median over a static wall stopped changing long before 160
+    samples. ``None`` lifts the bound.
     """
     width, height = track.size
     out_w, out_h = max(1, int(round(width * scale))), max(1, int(round(height * scale)))
     resize = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]], dtype=np.float64)
+
+    if memory_mb is not None:
+        per_sample = out_w * out_h * (3 + 1 + (4 if sharpness_weight else 0))
+        affordable = max(8, int(memory_mb * 1e6 // per_sample))
+        if affordable < max_samples and console:
+            console.print(f"  [yellow]large canvas[/] ({out_w}x{out_h}): taking "
+                          f"{affordable} frames instead of {max_samples} to stay "
+                          f"within WALL_MEMORY_MB = {memory_mb:.0f}")
+        max_samples = min(max_samples, affordable)
 
     indices = list(range(0, track.n_frames, max(1, stride)))
     if len(indices) > max_samples:
@@ -103,10 +122,12 @@ def build(video: Path, track: Track, *, stride: int = 4, scale: float = 1.0,
     if not capture.isOpened():
         raise RuntimeError(f"OpenCV could not open {video}")
 
-    stack: list[np.ndarray] = []
-    weights: list[np.ndarray] = []
-    coverage = np.zeros((out_h, out_w), dtype=np.int32)
+    tiles = np.empty((len(indices), out_h, out_w, 3), dtype=np.uint8)
+    seen = np.empty((len(indices), out_h, out_w), dtype=bool)
+    weights = (np.empty((len(indices), out_h, out_w), dtype=np.float32)
+               if sharpness_weight else None)
     ones = None
+    n = 0
 
     for count, index in enumerate(indices):
         capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
@@ -114,38 +135,56 @@ def build(video: Path, track: Track, *, stride: int = 4, scale: float = 1.0,
         if not ok:
             continue
         matrix = resize @ track.H[index]
-        warped = cv2.warpPerspective(frame, matrix, (out_w, out_h),
-                                     flags=cv2.INTER_LINEAR)
+        tiles[n] = cv2.warpPerspective(frame, matrix, (out_w, out_h),
+                                       flags=cv2.INTER_LINEAR)
         if ones is None:
             ones = np.ones(frame.shape[:2], dtype=np.uint8)
-        seen = cv2.warpPerspective(ones, matrix, (out_w, out_h),
-                                   flags=cv2.INTER_NEAREST).astype(bool)
-
         # Outside the frame's own footprint the warp is black, which is not a
-        # colour this frame is claiming — it is an absence. NaN says so, and
-        # nanmedian then ignores it instead of voting black.
-        tile = warped.astype(np.float32)
-        tile[~seen] = np.nan
-        stack.append(tile)
-        coverage += seen
+        # colour this frame is claiming — it is an absence. The mask says so,
+        # and the reduction ignores it instead of voting black.
+        seen[n] = cv2.warpPerspective(ones, matrix, (out_w, out_h),
+                                      flags=cv2.INTER_NEAREST).astype(bool)
 
-        if sharpness_weight:
+        if weights is not None:
             local = _local_scale(matrix, (out_w, out_h))
-            local[~seen] = 0.0
-            weights.append(local)
+            local[~seen[n]] = 0.0
+            weights[n] = local
+        n += 1
 
         if console and count and count % 50 == 0:
             console.print(f"  [dim]blended {count}/{len(indices)}[/]")
     capture.release()
 
-    if not stack:
+    if not n:
         raise RuntimeError("no frame could be warped onto the canvas")
 
-    wall = _reduce(stack, weights if sharpness_weight else None)
-    return wall, coverage
+    tiles, seen = tiles[:n], seen[:n]
+    weights = weights[:n] if weights is not None else None
+    coverage = seen.sum(axis=0, dtype=np.int32)
+    return _reduce(tiles, seen, weights), coverage
 
 
-def _reduce(stack: list[np.ndarray], weights: list[np.ndarray] | None) -> np.ndarray:
+def _median(samples: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Per-pixel median over axis 0, ignoring NaN; 0 where nothing was seen.
+
+    The same values `np.nanmedian` gives, several times faster: NaN sorts to the
+    end, so the median of each pixel's *counts* real samples sits at a known
+    index of the sorted column. `nanmedian` gets there through masked arrays,
+    and on a stack this size that was most of the wall step's time.
+    """
+    ordered = np.sort(samples, axis=0)
+    lo = np.maximum((counts - 1) // 2, 0)[None, ..., None]
+    hi = np.maximum(counts // 2, 0)[None, ..., None]
+    shape = (1,) + ordered.shape[1:]
+    a = np.take_along_axis(ordered, np.broadcast_to(lo, shape), axis=0)[0]
+    b = np.take_along_axis(ordered, np.broadcast_to(hi, shape), axis=0)[0]
+    median = (a + b) / 2
+    median[counts == 0] = 0.0
+    return median
+
+
+def _reduce(tiles: np.ndarray, seen: np.ndarray, weights: np.ndarray | None, *,
+            rows: int = 32) -> np.ndarray:
     """The per-pixel median of the warped stack, sharpened toward the closest looks.
 
     Two passes rather than one. The median alone is robust but soft: it picks a
@@ -158,33 +197,44 @@ def _reduce(stack: list[np.ndarray], weights: list[np.ndarray] | None) -> np.nda
     So the median decides what is wall and what is climber, and the weighted
     mean decides how sharply the wall is drawn. Outliers are excluded by the
     first step and cannot come back in the second.
+
+    Done *rows* at a time. Every output pixel depends only on its own column of
+    samples, so a strip gives exactly the answer the whole canvas would, and the
+    float working copy is one strip deep instead of the whole stack.
     """
-    tiles = np.stack(stack)
-    # The canvas is the bounding box of a set of rotated quadrilaterals, so its
-    # corners are pixels no frame ever covered: an all-NaN stack there is the
-    # expected answer, not an anomaly worth a warning on every run.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        median = np.nan_to_num(np.nanmedian(tiles, axis=0))
-
-    if weights is None:
-        return np.clip(median, 0, 255).astype(np.uint8)
-
+    _, height, width, _ = tiles.shape
+    out = np.empty((height, width, 3), dtype=np.uint8)
     # "Agrees with the median" is generous on purpose: this rejects the climber,
     # not exposure wobble between frames.
     tolerance = 42.0
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        close = (np.nanmax(np.abs(tiles - median[None]), axis=-1) <= tolerance)
-    close &= ~np.isnan(tiles[..., 0])
 
-    weight = np.stack(weights) * close
-    total = weight.sum(axis=0)
-    blended = (np.nan_to_num(tiles) * weight[..., None]).sum(axis=0)
-    out = np.where(total[..., None] > 1e-6,
-                   blended / np.maximum(total, 1e-6)[..., None],
-                   median)
-    return np.clip(out, 0, 255).astype(np.uint8)
+    for top in range(0, height, rows):
+        band = slice(top, min(height, top + rows))
+        mask = seen[:, band]
+        strip = tiles[:, band].astype(np.float32)
+        strip[~mask] = np.nan
+        median = _median(strip, mask.sum(axis=0))
+
+        if weights is None:
+            out[band] = np.clip(median, 0, 255).astype(np.uint8)
+            continue
+
+        # The canvas is the bounding box of a set of rotated quadrilaterals, so
+        # its corners are pixels no frame ever covered: all-NaN columns there
+        # are the expected answer, not an anomaly worth a warning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            close = np.nanmax(np.abs(strip - median[None]), axis=-1) <= tolerance
+        close &= mask
+
+        weight = weights[:, band] * close
+        total = weight.sum(axis=0)
+        blended = (np.nan_to_num(strip) * weight[..., None]).sum(axis=0)
+        mixed = np.where(total[..., None] > 1e-6,
+                         blended / np.maximum(total, 1e-6)[..., None],
+                         median)
+        out[band] = np.clip(mixed, 0, 255).astype(np.uint8)
+    return out
 
 
 def trim(wall: np.ndarray, coverage: np.ndarray, *, min_frames: int = 1
