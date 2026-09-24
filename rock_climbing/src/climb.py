@@ -166,14 +166,56 @@ class HoldGeometry:
         return best_hold
 
 
-def limb_point(poses, frame: int, limb: Limb, *, cfg):
-    """A limb's position for the inclusion test, or None when not visible."""
+def limb_point(poses, frame: int, limb: Limb, *, cfg, toe_offset: float | None = None):
+    """A limb's position for the inclusion test, or None when not visible.
+
+    *toe_offset* is how far below the ankle joint to put the contact point, in
+    canvas units — :func:`scales` derives it from the climber's own height, so
+    it is a foot rather than whatever fraction of the canvas the camera happened
+    to leave. Omitted, the raw config number is used, which is only right if the
+    caller has already scaled it.
+    """
     if not poses.valid[frame][limb.kpt]:
         return None
     x, y = poses.kpts[frame][limb.kpt]
     if cfg.ANKLE_LENIENCY and limb.kpt in ANKLE_KPTS:
-        y = y + cfg.ANKLE_TO_TOE_OFFSET
+        y = y + (cfg.ANKLE_TO_TOE_OFFSET if toe_offset is None else toe_offset)
     return float(x), float(y)
+
+
+def scales(holds: list[dict], poses) -> tuple[float, float]:
+    """``(hold_unit, body_unit)`` — the two lengths every threshold is quoted in.
+
+    The thresholds below used to be fractions of the frame, which worked while
+    the frame was the wall: one tripod shot, the boulder filling it, so "1.8% of
+    the frame" was a fixed distance on the rock. Neither half of that survives
+    here. The canvas is sized by wherever the camera wandered, so the boulder
+    occupies whatever fraction of it that turned out to be — on this clip about
+    half, with ceiling above and mats below. The identical config number is
+    therefore 0.58 hold-heights on the tripod clip and 0.92 here: over half as
+    generous again, which is how a hand ends up "on" a hold it is a hold's width
+    away from.
+
+    So the thresholds stop being fractions of anything the camera decides, and
+    become multiples of two things the scene decides:
+
+    ``hold_unit``  the median hold's height. Contact margins scale with it,
+                   because whether a hand is on a hold is a question about the
+                   hold's own size — a fingertip off a crimp is off it, and a
+                   fingertip off a volume is still on it.
+
+    ``body_unit``  the climber's median bounding-box height. Body clearances
+                   scale with it, because how far a toe hangs below an ankle and
+                   how far off the mat counts as "off the mat" are questions
+                   about the person, not about the wall.
+
+    Both are measured from this clip, so the numbers in `config.py` mean the
+    same thing on the next one however it was framed.
+    """
+    hold_unit = float(np.median([h["bbox"][3] for h in holds])) if holds else 0.02
+    boxes = [poses.bboxes[f][3] for f in poses.frames() if f in poses.bboxes]
+    body_unit = float(np.median(boxes)) if boxes else 0.25
+    return max(hold_unit, 1e-4), max(body_unit, 1e-4)
 
 
 def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
@@ -183,7 +225,9 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
     if not holds or not frames:
         return ClimbAnalysis({}, {}, {}, [], {}, None, None, None, fps, holds)
 
-    geometry = HoldGeometry(holds, bbox_margin=cfg.HOLD_BBOX_MARGIN, aspect=aspect)
+    hold_unit, body_unit = scales(holds, poses)
+    geometry = HoldGeometry(holds, bbox_margin=cfg.HOLD_BBOX_MARGIN * hold_unit,
+                            aspect=aspect)
     dwell_frames = max(1, int(round(cfg.HOLD_DWELL_SECONDS * fps)))
     final_frames = max(1, int(round(cfg.FINAL_HOLD_DWELL_SECONDS * fps)))
     # The top hold is often tapped rather than settled onto, so it confirms on a
@@ -192,10 +236,13 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
     final_touch_frames = max(1, int(round(cfg.FINAL_HOLD_TOUCH_SECONDS * fps)))
     # A contact that never gets within `graze_depth` of the hold's outline has to
     # last `graze_frames` rather than the ordinary dwell. See HOLD_GRAZE_DEPTH.
-    graze_depth = cfg.HOLD_GRAZE_DEPTH
+    graze_depth = cfg.HOLD_GRAZE_DEPTH * hold_unit
     graze_frames = max(1, int(round(cfg.HOLD_GRAZE_DWELL_SECONDS * fps)))
-    enter, release = cfg.HOLD_MASK_MARGIN, cfg.HOLD_RELEASE_MARGIN
-    clearance = cfg.FLOOR_CLEARANCE
+    enter = cfg.HOLD_MASK_MARGIN * hold_unit
+    release = cfg.HOLD_RELEASE_MARGIN * hold_unit
+    clearance = cfg.FLOOR_CLEARANCE * body_unit
+    toe_offset = cfg.ANKLE_TO_TOE_OFFSET * body_unit
+    start_frames = max(1, int(round(cfg.START_DWELL_SECONDS * fps)))
 
     final_hold = min(holds, key=lambda h: h["bbox"][1] + h["bbox"][3] / 2)
 
@@ -243,7 +290,7 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
         now: dict[str, int] = {}
         for limb in LIMBS:
             key = limb.key
-            point = limb_point(poses, frame, limb, cfg=cfg)
+            point = limb_point(poses, frame, limb, cfg=cfg, toe_offset=toe_offset)
 
             if point is None:
                 close(key)
@@ -253,10 +300,25 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
             # it is within the *release* margin — a looser boundary than the one
             # it had to cross to get there. Only once it is clearly off does the
             # limb look for a new hold, on the tight margin.
+            #
+            # With one exception, and it matters: hysteresis exists to stop a
+            # limb letting go of a hold for *nothing*, not to stop it moving to a
+            # better one. Two long rails on this wall are set parallel a hand's
+            # width apart — closer than the release margin — so a hand that
+            # matched the lower one first stayed matched to it after it had
+            # visibly transferred to the upper one, and the upper rail never lit
+            # up despite being held for two seconds. A hold the limb is *further
+            # inside* than its current one is not a candidate to be resisted, it
+            # is the answer.
             current = geometry.by_id.get(on[key]) if on[key] is not None else None
             depth = geometry.depth(current, *point) if current is not None else None
             if depth is not None and depth >= -release:
-                chosen = current
+                better = geometry.best(*point, margin=enter)
+                chosen = better if (better is not None
+                                    and better["id"] != current["id"]
+                                    and geometry.depth(better, *point) > depth) else current
+                if chosen is not current:
+                    depth = None
             else:
                 chosen = geometry.best(*point, margin=enter)
                 depth = None
@@ -356,8 +418,18 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
                 for limb in LIMBS:
                     if limb.kpt not in ANKLE_KPTS:
                         continue
-                    point = limb_point(poses, frame, limb, cfg=cfg)
-                    if point is None or not floor.is_clear(*point, clearance):
+                    point = limb_point(poses, frame, limb, cfg=cfg,
+                                       toe_offset=toe_offset)
+                    # A foot on a hold is off the ground, whatever the floor line
+                    # says about it. Two independent pieces of evidence rather
+                    # than one, which matters on a low start: the toe and the mat
+                    # are then a couple of centimetres apart and the floor test
+                    # is deciding the climb on pose noise.
+                    if point is None:
+                        feet_up = False
+                        break
+                    if on[limb.key] is None and not floor.is_clear(*point, clearance,
+                                                                  frame=frame):
                         feet_up = False
                         break
                 gripping = any(now.get(limb.key) is not None for limb in LIMBS)
@@ -366,8 +438,15 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
                 started = all(on[limb.key] is not None
                               for limb in LIMBS if limb.kpt in ANKLE_KPTS)
 
-            start_dwell = start_dwell + 1 if started else 0
-            if start_dwell >= dwell_frames:
+            # Leaky, not a reset. A single frame where ViTPose drops an ankle
+            # into the mat should cost the counter one frame, not all of them:
+            # resetting means the clock needs START_DWELL_SECONDS of *flawless*
+            # pose, and on a climber hanging a hand's width off the ground it
+            # never gets it. The clock started seven seconds late on this clip
+            # for exactly that reason.
+            start_dwell = (start_dwell + 1 if started
+                           else max(0, start_dwell - cfg.START_DWELL_DECAY))
+            if start_dwell >= start_frames:
                 # Backdate to the first frame of the run, not the frame the dwell
                 # matured on: the climber left the ground half a second ago.
                 start_frame = frame - start_dwell + 1
@@ -757,9 +836,14 @@ def hold_times(analysis: ClimbAnalysis, *, cfg) -> list[dict]:
     return rows
 
 
-def route_path(analysis: ClimbAnalysis, width: int, height: int, *,
-               sigma: float, n_points: int = 60) -> list[tuple[int, int]]:
-    """The smoothed midline path, in pixels, from pulling on to topping out.
+def route_path(analysis: ClimbAnalysis, *, sigma: float,
+               n_points: int = 60) -> list[tuple[float, float]]:
+    """The smoothed midline path from pulling on to topping out, normalized.
+
+    Normalized rather than in pixels, and on the canvas rather than in a frame:
+    the line is a statement about the wall, so it is the renderer's job to place
+    it in whatever panel it ends up drawn on — and it no longer has to be
+    recomputed if that panel changes size.
 
     Smoothed because the raw centroid wobbles with every reach; the line is
     meant to read as the shape of the climb, not as a seismograph of it.
@@ -778,12 +862,12 @@ def route_path(analysis: ClimbAnalysis, width: int, height: int, *,
     if len(frames) < 4:
         return []
 
-    xs = gaussian_filter1d(np.array([analysis.midline[f][0] * width for f in frames]),
+    xs = gaussian_filter1d(np.array([analysis.midline[f][0] for f in frames]),
                            sigma=sigma, mode="nearest")
-    ys = gaussian_filter1d(np.array([analysis.midline[f][1] * height for f in frames]),
+    ys = gaussian_filter1d(np.array([analysis.midline[f][1] for f in frames]),
                            sigma=sigma, mode="nearest")
     idx = np.linspace(0, len(xs) - 1, min(n_points, len(xs))).astype(int)
-    return [(int(xs[i]), int(ys[i])) for i in idx]
+    return [(float(xs[i]), float(ys[i])) for i in idx]
 
 
 def summary_text(analysis: ClimbAnalysis, rows: list[dict], util: Utilization, *,

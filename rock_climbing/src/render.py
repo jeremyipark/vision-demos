@@ -8,6 +8,15 @@ whole climb is measured from. The clock runs from pulling on, and stops on the t
 
 Taking the climber away is the point of the right panel: the left one shows that
 the models work, and the right one shows what they *found*, which is a route.
+
+Handheld, the two panels stop sharing a coordinate system, and the split is what
+the demo is about. The left panel is the camera's view, so the route is projected
+into every frame through that frame's homography and rides the pan. The right
+panel is the *wall's* view — the mosaic from :mod:`src.mosaic`, which holds
+still no matter what the operator does — so the route is drawn on it once and
+never moves again. A rectangle on the right traces what the left is currently
+looking at, because once the camera has zoomed in, nothing else says which part
+of the wall the live shot is a detail of.
 """
 
 from __future__ import annotations
@@ -18,7 +27,8 @@ import cv2
 import numpy as np
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn
 
-from . import climb, floor as floor_mod, skeleton, text as text_mod
+from . import (climb, floor as floor_mod, holds as holds_mod, skeleton,
+               text as text_mod)
 
 
 def _px(base: float, scale: float) -> int:
@@ -35,9 +45,37 @@ def _polygon_px(hold: dict, width: int, height: int):
     return arr.reshape(-1, 1, 2).astype(np.int32)
 
 
+def _dashed_polyline(frame, poly, color, thickness, *, dash: int = 6, gap: int = 4):
+    """A closed polygon drawn as a dashed outline, walked at constant arc length."""
+    pts = poly.reshape(-1, 2).astype(float)
+    loop = np.vstack([pts, pts[:1]])
+    drawing, budget = True, float(dash)
+    for a, b in zip(loop, loop[1:]):
+        length = float(np.hypot(*(b - a)))
+        walked = 0.0
+        while walked < length:
+            step = min(budget, length - walked)
+            if drawing:
+                p0 = a + (b - a) * (walked / length)
+                p1 = a + (b - a) * ((walked + step) / length)
+                cv2.line(frame, tuple(np.round(p0).astype(int)),
+                         tuple(np.round(p1).astype(int)), color, thickness, cv2.LINE_AA)
+            walked += step
+            budget -= step
+            if budget <= 1e-6:
+                drawing = not drawing
+                budget = float(dash if drawing else gap)
+
+
 def draw_hold(frame, hold, width, height, color, thickness, *, fill: bool,
-              alpha: float):
-    """Outline a hold, optionally filling it. Falls back to the box with no mask."""
+              alpha: float, dashed: bool = False):
+    """Outline a hold, optionally filling it. Falls back to the box with no mask.
+
+    *dashed* marks a hold recovered by `src.recover` rather than segmented from
+    the prompt. It rests on one box-prompted look plus the climber's behaviour,
+    not on a hundred sightings agreeing, and a dashed outline says so instead of
+    letting it pass as one of the others.
+    """
     poly = _polygon_px(hold, width, height)
     if poly is None:
         x, y, w, h = hold["bbox"]
@@ -50,7 +88,10 @@ def draw_hold(frame, hold, width, height, color, thickness, *, fill: bool,
         overlay = frame.copy()
         cv2.fillPoly(overlay, [poly], color)
         cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
-    cv2.polylines(frame, [poly], True, color, thickness, cv2.LINE_AA)
+    if dashed:
+        _dashed_polyline(frame, poly, color, thickness)
+    else:
+        cv2.polylines(frame, [poly], True, color, thickness, cv2.LINE_AA)
 
 
 def draw_dashed_spline(frame, points, color, thickness, dash, gap):
@@ -595,7 +636,8 @@ def holds_preview(frame, holds, color, *, scale: float = 1.0):
     out = frame.copy()
     thickness = _px(2, scale)
     for hold in holds:
-        draw_hold(out, hold, width, height, color, thickness, fill=True, alpha=0.35)
+        draw_hold(out, hold, width, height, color, thickness, fill=True, alpha=0.35,
+                  dashed=hold.get("recovered", False))
         x, y, w, h = hold["bbox"]
         cv2.putText(out, str(hold["id"]),
                     (int(x * width), max(12, int(y * height) - 4)),
@@ -604,7 +646,8 @@ def holds_preview(frame, holds, color, *, scale: float = 1.0):
 
 
 def render(info, holds, poses, analysis, route_points, out_path: Path, *,
-           cfg, console, right_path: Path | None = None, ground=None,
+           cfg, console, camera, wall, fit, frame_poses=None, colour=None,
+           right_path: Path | None = None, ground=None,
            comparison=None, label: str | None = None) -> dict:
     """Write the paired panels (and optionally the right one alone) as raw MP4.
 
@@ -615,6 +658,21 @@ def render(info, holds, poses, analysis, route_points, out_path: Path, *,
     With a *comparison* and a *label*, the render ends on the completion panel:
     the card comes up when the route tops out, and the last frame is held past
     the end of the source for long enough to read it.
+
+    The two panels now live in two different coordinate systems, which is the
+    whole shape of the handheld version:
+
+    * **left** is the clip as shot, so the route has to be projected *into* each
+      frame through that frame's homography — the holds move because the camera
+      does, and they have to move with the wall exactly.
+    * **right** is the canvas: the wall mosaic, holding still, with the route on
+      it. Nothing here moves at all, which is the point of it.
+
+    ``holds``, ``poses``, ``analysis`` and ``route_points`` are all in canvas
+    coordinates. ``frame_poses`` is the same climber back in frame coordinates,
+    for drawing the skeleton on the left; it is passed rather than un-projected
+    here because the un-projection is lossy at the frame edges and the caller
+    already has the original.
     """
     width, height = info.width, info.height
     # Every size in config is quoted at the inference width, so an export at a
@@ -623,7 +681,8 @@ def render(info, holds, poses, analysis, route_points, out_path: Path, *,
 
     font = text_mod.resolve_font(cfg.PANEL_FONT, cfg.PANEL_FONT_INDEX)
     edges, points = skeleton.visible_parts(cfg.DRAW_FACE)
-    hold_color = cfg.HOLD_RENDER_COLOR.get(cfg.HOLD_COLOR, cfg.HOLD_COLOR_FALLBACK)
+    hold_color = cfg.HOLD_RENDER_COLOR.get(colour or cfg.HOLD_COLOR,
+                                           cfg.HOLD_COLOR_FALLBACK)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     pair = cv2.VideoWriter(str(out_path), fourcc, info.fps, (width * 2, height))
@@ -634,9 +693,19 @@ def render(info, holds, poses, analysis, route_points, out_path: Path, *,
     if not cap.isOpened():
         raise RuntimeError(f"OpenCV could not open {info.path}")
 
+    # The route as the right panel will draw it: canvas coordinates placed into
+    # the panel's box. Computed once — the panel does not move.
+    panel_holds = [fit.hold(h) for h in holds]
     centroids = {h["id"]: (int((h["bbox"][0] + h["bbox"][2] / 2) * width),
                            int((h["bbox"][1] + h["bbox"][3] / 2) * height))
-                 for h in holds}
+                 for h in panel_holds}
+    panel_route = ([tuple(p) for p in
+                    fit.point(np.asarray(route_points, dtype=float)) * [width, height]]
+                   if route_points else [])
+    backdrop = (fit.backdrop(wall, dim=cfg.ROUTE_BACKDROP_DIM)
+                if wall is not None and cfg.ROUTE_BACKDROP else
+                np.zeros((height, width, 3), dtype=np.uint8))
+    viewport_quad = None
 
     inactive_thick = _px(cfg.HOLD_INACTIVE_THICK, scale)
     active_thick = _px(cfg.HOLD_ACTIVE_THICK, scale)
@@ -725,28 +794,50 @@ def render(info, holds, poses, analysis, route_points, out_path: Path, *,
 
             # ── left: the clip, with what the models saw on it ───────────────
             left = frame
-            if ground is not None and cfg.DRAW_FLOOR_LINE:
+            if ground is not None and cfg.DRAW_FLOOR_LINE and frame_index < camera.n_frames:
+                # The ground line lives on the canvas now, so it comes back into
+                # the frame the same way the holds do.
                 floor_mod.draw(left, ground, color=cfg.FLOOR_LINE_COLOR,
-                               thickness=_px(cfg.FLOOR_LINE_THICK, scale))
-            for hold in holds:
+                               thickness=_px(cfg.FLOOR_LINE_THICK, scale),
+                               transform=lambda pts, i=frame_index: camera.to_frame(pts, i))
+            # The route projected into *this* frame. The holds are stored once,
+            # on the canvas, and this is the only place they become pixels on
+            # the moving image — so the outlines track the wall through every
+            # pan and zoom without ever having been detected in this frame.
+            live = ([{**hold,
+                      "polygon": holds_mod.in_frame(hold, camera, frame_index).tolist()}
+                     for hold in holds] if frame_index < camera.n_frames else [])
+            for hold in live:
                 draw_hold(left, hold, width, height, hold_color, outline_thick,
-                          fill=True, alpha=cfg.HOLD_FILL_ALPHA)
+                          fill=True, alpha=cfg.HOLD_FILL_ALPHA,
+                          dashed=cfg.RECOVERED_DASH and hold.get("recovered", False))
 
-            has_pose = frame_index in poses.kpts
+            shown = frame_poses if frame_poses is not None else poses
+            has_pose = frame_index in shown.kpts
             if has_pose:
                 stats["frames_with_pose"] += 1
                 skeleton.draw_person(
-                    left, poses.kpts[frame_index], poses.valid[frame_index],
+                    left, shown.kpts[frame_index], shown.valid[frame_index],
                     width=width, height=height, edges=edges, points=points,
                     colors=cfg.SKELETON_COLORS,
                     thickness=_px(cfg.LINE_THICKNESS, scale),
                     radius=_px(cfg.POINT_RADIUS, scale),
-                    bbox=poses.bboxes[frame_index] if cfg.DRAW_PERSON_BBOX else None,
+                    bbox=shown.bboxes[frame_index] if cfg.DRAW_PERSON_BBOX else None,
                     bbox_color=cfg.PERSON_BBOX_COLOR,
                     bbox_thickness=_px(cfg.PERSON_BBOX_THICK, scale))
 
             # ── right: the route, with the climber taken away ────────────────
-            right = np.zeros((height, width, 3), dtype=np.uint8)
+            right = backdrop.copy()
+
+            # Where the live shot is looking, drawn on the canvas. Without it the
+            # two panels are hard to relate once the camera has zoomed: the left
+            # is a detail of the right and nothing says which detail.
+            if cfg.DRAW_VIEWPORT and frame_index < camera.n_frames:
+                viewport_quad = np.round(
+                    fit.point(camera.coverage(frame_index)) * [width, height]
+                ).astype(np.int32)
+                cv2.polylines(right, [viewport_quad], True, cfg.VIEWPORT_COLOR,
+                              _px(cfg.VIEWPORT_THICK, scale), cv2.LINE_AA)
 
             # After topping out the panel holds its final state, so the last
             # frames read as a finished route rather than continuing to update.
@@ -762,25 +853,26 @@ def render(info, holds, poses, analysis, route_points, out_path: Path, *,
             # The numbering is a property of the wall, so a hold nobody touched
             # is still hold 3 — and "you could have used 3" needs 3 to be on
             # screen, not inferred from the gap between 2 and 4.
-            for hold in holds:
+            for hold in panel_holds:
                 hid = hold["id"]
                 if hid not in analysis.activated_at or analysis.activated_at[hid] > effective:
                     draw_hold(right, hold, width, height, cfg.HOLD_INACTIVE_COLOR,
-                              inactive_thick, fill=False, alpha=0.0)
+                              inactive_thick, fill=False, alpha=0.0,
+                              dashed=cfg.RECOVERED_DASH and hold.get("recovered", False))
                     if cfg.HOLD_LABEL == "id":
                         text_mod.draw(right, str(hid), font, size=label_size,
                                       xy=(int(hold["bbox"][0] * width),
                                           int(hold["bbox"][1] * height) - _px(2, scale)),
                                       color=cfg.HOLD_INACTIVE_LABEL_COLOR, anchor="lb")
 
-            if topped and route_points and cfg.ROUTE_SPLINE:
-                draw_dashed_spline(right, route_points, cfg.ROUTE_SPLINE_COLOR,
+            if topped and panel_route and cfg.ROUTE_SPLINE:
+                draw_dashed_spline(right, panel_route, cfg.ROUTE_SPLINE_COLOR,
                                    _px(cfg.ROUTE_SPLINE_THICKNESS, scale),
                                    _px(cfg.ROUTE_SPLINE_DASH, scale),
                                    _px(cfg.ROUTE_SPLINE_GAP, scale))
 
             active = sorted(
-                (h for h in holds
+                (h for h in panel_holds
                  if h["id"] in analysis.activated_at
                  and analysis.activated_at[h["id"]] <= effective),
                 key=lambda h: analysis.order[h["id"]])
@@ -791,7 +883,8 @@ def render(info, holds, poses, analysis, route_points, out_path: Path, *,
                 color = cfg.HOLD_COMPLETE_COLOR if done else hold_color
                 alpha = cfg.HOLD_COMPLETE_ALPHA if done else cfg.HOLD_ACTIVE_FILL_ALPHA
                 draw_hold(right, hold, width, height, color, active_thick,
-                          fill=True, alpha=alpha)
+                          fill=True, alpha=alpha,
+                          dashed=cfg.RECOVERED_DASH and hold.get("recovered", False))
                 cv2.circle(right, centroids[hid], _px(3, scale), color, -1, cv2.LINE_AA)
 
                 if cfg.HOLD_LABEL != "none":
@@ -822,9 +915,13 @@ def render(info, holds, poses, analysis, route_points, out_path: Path, *,
             if analysis.start_frame is not None and frame_index >= analysis.start_frame:
                 position = analysis.midline.get(frame_index)
                 if position is not None:
-                    trail.append((int(position[0] * width), int(position[1] * height)))
-                    if len(trail) > cfg.MIDLINE_TRAIL_FRAMES:
-                        trail.pop(0)
+                    # The midline is on the canvas, so it is where the body is
+                    # on the *wall*: a climber holding a rest stays put on the
+                    # trail even while the camera drifts around them.
+                    px, py = fit.point(np.array([position]))[0]
+                    trail.append((int(px * width), int(py * height)))
+                if len(trail) > cfg.MIDLINE_TRAIL_FRAMES:
+                    trail.pop(0)
 
             n = len(trail)
             for i, (tx, ty) in enumerate(trail[:-1]):

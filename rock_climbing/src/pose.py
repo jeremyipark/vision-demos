@@ -53,6 +53,15 @@ class PoseResult:
         return sorted(self.kpts)
 
 
+def encode_video(video: Path) -> str:
+    """The clip as base64, for a request that uploads the whole thing.
+
+    Both video calls need it — ViTPose for the pose and SAM 3.1 for the hold
+    tracks — so it lives in one place rather than being spelled twice.
+    """
+    return base64.b64encode(video.read_bytes()).decode("ascii")
+
+
 def build_request(video: Path, *, every_frame: bool, fps: float, n_frames: int,
                   video_fps: float, video_max_frames, precision: int) -> tuple[str, dict]:
     """Return ``(base64_video, extra_body)``.
@@ -69,7 +78,7 @@ def build_request(video: Path, *, every_frame: bool, fps: float, n_frames: int,
     if video_max_frames is not None:
         extra_body["video_max_frames"] = video_max_frames
 
-    return base64.b64encode(video.read_bytes()).decode("ascii"), extra_body
+    return encode_video(video), extra_body
 
 
 def request_poses(client, *, model: str, video_b64: str, extra_body: dict):
@@ -132,7 +141,8 @@ def _area(box) -> float:
 
 
 def pick_track(items: list[dict], *, mask, overlap_fn, min_overlap: float,
-               lock_to_wall: bool) -> tuple[int | None, dict]:
+               lock_to_wall: bool
+               ) -> tuple[int | None, dict]:
     """Choose the climber's track, once, for the whole clip.
 
     Scored on how much of each track sits on the route rather than on size or
@@ -152,7 +162,10 @@ def pick_track(items: list[dict], *, mask, overlap_fn, min_overlap: float,
     stats = {}
     total_frames = len({i.get("frame_id") for i in items}) or 1
     for track, records in by_track.items():
-        overlaps = [overlap_fn(r["bbox_xywh"], mask) for r in records] if mask is not None else []
+        if mask is not None:
+            overlaps = [overlap_fn(r["bbox_xywh"], mask) for r in records]
+        else:
+            overlaps = []
         stats[track] = {
             "frames": len(records),
             "coverage": len(records) / total_frames,
@@ -254,6 +267,72 @@ def confident_points(result: PoseResult) -> np.ndarray:
     """Every visible keypoint, as an (N, 2) array. The climber's whole trajectory."""
     pts = [result.kpts[f][result.valid[f]] for f in result.frames()]
     return np.concatenate(pts, axis=0) if pts else np.zeros((0, 2), dtype=np.float32)
+
+
+def project(result: PoseResult, camera) -> PoseResult:
+    """The same keypoints, moved onto the canvas.
+
+    Everything after this point — the touch tests, the route line, the body's
+    trail on the right panel — wants the climber in the wall's frame of
+    reference rather than the camera's, and for three separate reasons.
+
+    **A margin stops meaning two different things.** ``HOLD_MASK_MARGIN`` is a
+    fraction of the frame. With a fixed camera that is a fixed distance on the
+    wall, so "within 1.8% of the frame of this hold" is one rule. Under a zoom
+    it is not: the same fraction is a hand's width on the wide shots and a
+    fingertip on the tight ones, so a hold would get easier to touch exactly as
+    the operator pushed in on the crux. On the canvas the wall has one scale and
+    the margin is one distance.
+
+    **A still hand becomes still.** In frame coordinates a hand locked onto a
+    hold still travels across the image whenever the camera pans, so the touch
+    test sees motion where there is none, and — worse — smoothing a keypoint's
+    path in time would smooth the *camera's* motion into the body's. Which is
+    why :func:`smooth` should run after this and not before.
+
+    **The right panel has something to draw on.** The trail and the route line
+    are statements about the wall, and the wall only holds still here.
+    """
+    kpts, valid, bboxes = {}, {}, {}
+    for frame in result.frames():
+        if frame >= camera.n_frames:
+            continue
+        kpts[frame] = camera.to_canvas(result.kpts[frame], frame).astype(np.float32)
+        valid[frame] = result.valid[frame]
+        box = result.bboxes.get(frame)
+        if box is not None:
+            x, y, w, h = box
+            corners = camera.to_canvas(
+                np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]]), frame)
+            lo, hi = corners.min(axis=0), corners.max(axis=0)
+            bboxes[frame] = [float(lo[0]), float(lo[1]),
+                             float(hi[0] - lo[0]), float(hi[1] - lo[1])]
+    return PoseResult(kpts=kpts, valid=valid, bboxes=bboxes, track_id=result.track_id,
+                      n_frames_returned=result.n_frames_returned,
+                      track_ids=result.track_ids)
+
+
+def project_boxes(items: list[dict], camera) -> list[dict]:
+    """Copies of the raw pose records with their boxes on the canvas.
+
+    :func:`pick_track` scores each track against the route's footprint, and the
+    route now lives on the canvas, so the boxes it scores have to as well. Done
+    before a track is chosen rather than after, because choosing is the thing
+    that needs the comparison.
+    """
+    out = []
+    for item in items:
+        frame = item.get("frame_id")
+        box = item.get("bbox_xywh")
+        if frame is None or frame >= camera.n_frames or not box:
+            continue
+        x, y, w, h = box
+        corners = camera.to_canvas(
+            np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]]), int(frame))
+        lo, hi = corners.min(axis=0), corners.max(axis=0)
+        out.append({**item, "bbox_xywh": [float(lo[0]), float(lo[1]),
+                                          float(hi[0] - lo[0]), float(hi[1] - lo[1])]})
+    return out
 
 
 # ── cache ────────────────────────────────────────────────────────────────────

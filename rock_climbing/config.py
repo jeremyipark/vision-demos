@@ -10,6 +10,18 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "data"
 
+# ── Caches ───────────────────────────────────────────────────────────────────
+# Every expensive step is cached in CACHE_DIR, keyed on the clip and the settings
+# that shaped it, so changing a setting already misses on its own. Set one of
+# these to False to make that step redo its work anyway. The gateway ones cost
+# money; the local ones cost time.
+REUSE_HOLDS = True       # SAM 3.1 hold tracking         (gateway)
+REUSE_FLOOR = True       # SAM 3.1 floor segmentation    (gateway)
+REUSE_POSES = True       # ViTPose                       (gateway)
+REUSE_CAMERA = True      # camera track + still check    (local)
+REUSE_WALL = True        # stitched wall image           (local)
+FORCE_RECONVERT = False   # True re-runs ffmpeg even when a cached MP4 matches
+
 # ── Input ────────────────────────────────────────────────────────────────────
 # Batch mode is what makes the comparison possible. Every clip in INPUT_DIR is
 # treated as another attempt at the *same* route — same wall, same colour, same
@@ -38,10 +50,13 @@ INPUT_VIDEO = DATA_DIR / "input" / "climbing.mov"
 # clip is stored 3840x2160 with a -90 rotation, so the decoded frame is the
 # portrait 2160x3840 it was actually shot as.
 INFERENCE_HEIGHT = 1080   # uploaded to both models; ViTPose caps at a 2048px long edge
-EXPORT_HEIGHT = 1080      # rendered; each panel is one frame wide, so the output is 2x this
+# Rendered; each panel is one frame wide, so the output is 2x this across.
+# Capped rather than left at the source's own 3840: the right panel is a canvas
+# built from 1080p frames, so a 4K export upsamples it for nothing and turns a
+# 15 MB file into 290 MB.
+EXPORT_HEIGHT = 1080
 TRIM_SECONDS = None       # e.g. 8.0 for a fast test run
 CONVERT_CRF = 23
-FORCE_RECONVERT = False   # True re-runs ffmpeg even when a cached MP4 matches
 
 # ── HDR ──────────────────────────────────────────────────────────────────────
 # An iPhone recording in HDR writes HLG-encoded Rec. 2020, and nothing
@@ -64,6 +79,70 @@ TONEMAP = "auto"
 # a little brighter, `hable` is filmic and rolls the highlights off harder.
 TONEMAP_ALGORITHM = "bt.2446a"
 
+# ── The camera ───────────────────────────────────────────────────────────────
+# What makes a handheld clip work. Every frame is matched to one reference frame
+# and the resulting homography puts it on a shared canvas, so the wall has fixed
+# coordinates again even though the camera does not. A clip off a tripod needs
+# no special case: every homography comes out as the identity, the canvas is the
+# frame, and everything downstream reads exactly as it would have.
+#
+# It is worth knowing *why* a homography is enough, because it is not a
+# compromise here. `tools/parallax_check.py` fits one between two frames and
+# reports the residual by depth band; between the first and last frames of a
+# 43-second handheld clip it gives 0.74px on the ceiling trusses, 0.54px on the
+# prow, 0.48px on the main face and 2.10px on the mats — four surfaces metres
+# apart in depth, all but satisfied by a single planar map. Only a camera whose
+# optical centre barely moves can do that, and for pure rotation a homography
+# is exact rather than approximate. The operator standing on the mat, panning
+# and zooming to follow their friend up, is that camera.
+#
+# Walking along the wall is not. Run the check on a clip like that first: a
+# ceiling band that blows up to tens of pixels is the camera translating, and
+# no flat canvas will hold it.
+
+# None picks the most *central* frame — the one with the best median inlier
+# count against a spread of others — which is the view the canvas is built
+# around. Pin an integer to force one.
+CAMERA_REFERENCE = None
+CAMERA_PROBES = 12            # candidates considered when picking the reference
+
+# The probes double as a stillness test. If no probe frame's corners move more
+# than this many pixels against any other, the camera was on a tripod or a water
+# bottle: the per-frame pass is skipped and every frame gets the identity, in
+# ~1s instead of ~25s per 30s clip.
+#
+# Pixels at INFERENCE_HEIGHT. Measured on real clips at 1080: four water-bottle
+# takes gave 0.8, 1.9, 2.6 and 3.7px (the phone settling, plus fitting noise
+# magnified at the corners); a handheld take gave 125px. 5px sits in that gap
+# and is under a quarter of a hold's height — less than the 2-7px the full pass
+# itself disagrees with itself by. None always runs the full pass.
+CAMERA_STILL_PX = 5.0
+
+CAMERA_FEATURES = 3000        # SIFT keypoints per frame
+CAMERA_MATCH_RATIO = 0.75     # Lowe ratio; lower is stricter
+CAMERA_RANSAC_PX = 3.0        # MAGSAC++ inlier threshold, in source pixels
+CAMERA_MIN_INLIERS = 60       # below this a frame falls back to chaining
+
+# Temporal smoothing of the solved path, in frames, applied to the image corners
+# rather than to the matrix entries — see `_corner_smooth`. This removes the
+# last few tenths of a pixel of per-frame estimation noise, which the eye reads
+# as the route shimmering against a wall that is plainly not moving.
+CAMERA_SMOOTH_SIGMA = 1.5
+
+CAMERA_CANVAS_SCALE = 1.0     # canvas pixels per reference-frame pixel
+CAMERA_CANVAS_LIMIT = 3.0     # cap the canvas at this many frame-widths of slop
+
+# ── The wall canvas ──────────────────────────────────────────────────────────
+# The right panel's backdrop: every frame warped onto the canvas and reduced per
+# pixel. The reduction is a median, which is what erases the climber — they are
+# somewhere different in every frame, so no wall pixel sees them in more than a
+# handful of the stack, and a median ignores a minority outright.
+WALL_STRIDE = 6           # every nth frame considered
+WALL_MAX_SAMPLES = 160    # …capped here; the whole stack is held to take a median
+WALL_SCALE = 1.0          # canvas pixels per canvas pixel, for a finer mosaic
+WALL_SHARPNESS_WEIGHT = True   # favour the frames that resolved each pixel best
+WALL_MIN_COVERAGE = 3     # canvas seen by fewer frames than this is cropped away
+
 # ── Gateway ──────────────────────────────────────────────────────────────────
 GATEWAY_BASE_URL = "https://gateway.vlm.run/v1/openai"
 REQUEST_TIMEOUT = 1800.0   # seconds; video pose is minutes, not seconds
@@ -73,8 +152,13 @@ REQUEST_TIMEOUT = 1800.0   # seconds; video pose is minutes, not seconds
 # the colour and the demo follows a different route up the same wall.
 HOLD_MODEL = "facebook/sam3.1"
 HOLD_COLOR = "green"                        # the route being climbed
+
+# Per-clip override, keyed on the file's stem. A batch is normally one route
+# filmed several times, so one colour serves — but a folder of unrelated clips
+# is the common case while developing, and re-running the whole batch to change
+# one clip's colour is the sort of friction that stops you checking.
+HOLD_COLOR_BY_CLIP = {}      # e.g. {"IMG_4918": "pink"}
 HOLD_PROMPT = "{color} climbing hold"       # {color} is substituted from HOLD_COLOR
-REUSE_HOLDS = True        # False re-runs segmentation instead of using the cache
 
 # Route metadata. Recorded into every artifact — run.json, climb.json,
 # sequence.json, comparison.json — so a sequence can be traced back to the
@@ -83,41 +167,72 @@ REUSE_HOLDS = True        # False re-runs segmentation instead of using the cach
 ROUTE_GRADE = "VB"
 ROUTE_NAME = None         # e.g. "the green one by the door"; None omits it
 
-# Frames sampled for hold detection, evenly spaced across the whole clip. The
-# climber occludes a different part of the wall in each one, so a hold hidden
-# behind a shoulder at one moment is in clear view at most of the others.
-HOLD_SAMPLE_FRAMES = 12
-HOLD_REQUEST_WORKERS = 6   # sampled frames are independent calls; run them together
+# How often the holds are looked at. SAM 3.1's `track` method takes the whole
+# clip in one call and carries a `track_id` forward through it, so this is a
+# sampling rate rather than a set of independent looks: every HOLD_TRACK_STRIDE
+# source frames, the tracker is asked where each hold went.
+#
+# The tripod version sampled twelve frames in the whole clip and got away with
+# it, because the wall never moved and one detection served every frame. Nothing
+# about that survives a moving camera. At 30 fps a stride of 11 is a look every
+# 0.37s, which is short enough that no hold moves far between two of them and
+# the tracker never has to guess.
+#
+# The cap is the gateway's, not ours: SAM's tracker holds a frame of memory per
+# sample and `video_max_frames` tops out at 128. A longer clip is covered by
+# raising the stride, not the cap.
+HOLD_TRACK_STRIDE = 11
+HOLD_TRACK_MAX_FRAMES = 128
 HOLD_MIN_SCORE = 0.40      # drop instances SAM itself is unsure about
 
-# Consensus across those calls. Two instances are the same hold at IoU >= the
-# threshold; a cluster is kept once it appears in enough of the samples. A real
-# hold clears this comfortably, a one-frame false positive does not.
-HOLD_IOU_THRESHOLD = 0.30
-HOLD_MIN_APPEARANCE = 0.25    # fraction of sampled frames a hold must appear in
+# A `track_id` is SAM's claim that two sightings are the same hold, and on this
+# clip it is usually right and occasionally very wrong — one track jumps 125px
+# across the wall partway through, which is the tracker handing the id to a
+# different hold. The canvas is what makes that visible: a hold is bolted to a
+# wall, so every sighting of it must land on the same canvas pixels.
+#
+# A sighting further than this from its track's median position is dropped as an
+# identity switch. In multiples of the hold's own median size, not pixels: a big
+# volume's centroid legitimately wanders further than a crimp's.
+HOLD_REJECT_RADIUS = 2.5
+HOLD_MIN_SIGHTINGS = 8        # a track seen fewer times than this is not a hold
+
+# Fraction of the frames that *could have seen* this hold in which it was
+# actually found. The denominator is the camera track's answer, not the sample
+# count: handheld, a hold off-screen for half the clip would otherwise look like
+# a hold the model kept losing.
+HOLD_MIN_APPEARANCE = 0.30
+
+# SAM sometimes drops a track and picks the same hold back up under a new id.
+# On the canvas those are two outlines in the same place — a question only the
+# canvas can answer, since in the video they never coexist.
+#
+# Keep this high. The genuine re-identifications here overlap at 0.85+, because
+# they are literally the same hold twice; the pair that overlaps at 0.30 is the
+# two long rails set parallel a hand's width apart, and merging those loses a
+# hold and invents a shape spanning both.
+HOLD_MERGE_IOU = 0.60
 
 # IoU is symmetric, so it cannot see a small box nested inside a large one: a
-# knob segmented off its own hold scores ~0.28 against it, clears neither the
-# threshold above nor the appearance filter, and becomes an extra hold. Drop a
-# survivor with at least this much of its area inside a better one. Set to None
-# to keep every cluster. Two holds merely set close together overlap far less
-# than this, so the test is safe well below the ~0.95 the nesting case gives.
+# knob segmented off its own hold scores ~0.28 against it and becomes an extra
+# hold. Drop a survivor with at least this much of its area inside a better one.
+# Set to None to keep every cluster.
 HOLD_NMS_CONTAINMENT = 0.80
 
-# Per-hold mask averaging. Each cluster's masks are rasterized into a shared
-# grid over its own bounding box, pixel-voted, then re-contoured — so the drawn
-# shape is the agreement across samples rather than one frame's noisy edge.
+# Per-hold shape averaging, in canvas space. Each track's surviving outlines are
+# rasterized into a shared grid over its own extent, pixel-voted, then
+# re-contoured — so the drawn shape is the agreement across a hundred looks from
+# a hundred camera angles rather than any one frame's noisy edge.
 HOLD_RASTER_SIZE = 256        # raster long-side for the vote grid
-HOLD_VOTE_FRACTION = 0.5      # keep a pixel covered by >= this share of masks
+HOLD_VOTE_FRACTION = 0.5      # keep a pixel covered by >= this share of outlines
 HOLD_MIN_AREA_PX = 20         # drop a voted blob smaller than this, in vote-grid px
 HOLD_FILL_HOLES = True        # fill interior holes left by chalk / bolt shadows
 
-# Drops holds whose centroid falls outside the convex hull of the climber's own
-# confident keypoints, expanded by the margin. The body's trajectory defines the
-# route region; a correctly-coloured hold on a neighbouring wall is still not
-# part of this climb.
+# Drops holds outside the climber's route region: the expanded convex hull of
+# the body trajectory on the canvas. A correctly-coloured hold around the corner
+# is still not part of this climb.
 HOLD_SPATIAL_FILTER = True
-HOLD_SPATIAL_MARGIN = 0.08    # expand the hull by this fraction of the frame
+HOLD_SPATIAL_MARGIN = 0.08    # normalized margin around the body/trajectory
 
 # ── The floor: SAM 3.1 again ─────────────────────────────────────────────────
 # The clock starts when both feet leave the ground, which is the gym's own rule
@@ -132,16 +247,23 @@ HOLD_SPATIAL_MARGIN = 0.08    # expand the hull by this fraction of the frame
 #
 # With no floor found, the start rule falls back to both feet on holds.
 DETECT_FLOOR = True
+FLOOR_SAMPLE_FRAMES = 14      # stills the floor is read off; it does not need tracking
+FLOOR_REQUEST_WORKERS = 6     # those stills are independent calls; run them together
 FLOOR_PROMPT = "gray floor"   # "climbing mat" finds the wall padding instead
 FLOOR_MIN_SCORE = 0.50
 FLOOR_MIN_AREA = 0.02         # a floor smaller than this is something else
 FLOOR_EDGE_RESOLUTION = 256   # columns the edge is stored at
-REUSE_FLOOR = True
+# Canvas columns with fewer than this many frames agreeing are left unknown. The
+# outermost columns sit at the edge of what any camera saw, and one frame's
+# noisy last pixel there would anchor the line and hang a spur off each end.
+FLOOR_MIN_SUPPORT = 3
 
 # How far above the floor line a foot has to be to count as off the ground, in
-# frame heights. The toe point (ankle + ANKLE_TO_TOE_OFFSET) sits about at the
-# mat when standing, so this only has to clear the noise in that estimate.
-FLOOR_CLEARANCE = 0.012
+# **climber heights** (see `climb.scales`). The toe point sits about at the mat
+# when standing, so this only has to clear the noise in that estimate — and a
+# foot already matched to a hold skips the test entirely, since a foot on a hold
+# is off the ground whatever the floor line says.
+FLOOR_CLEARANCE = 0.03
 
 # The line the clock is measured against, drawn on the left panel only — there
 # it sits over the actual mat and can be checked; on the black panel it would be
@@ -152,7 +274,6 @@ FLOOR_LINE_THICK = 2
 
 # ── The climber: ViTPose ─────────────────────────────────────────────────────
 POSE_MODEL = "usyd-community/vitpose-plus-large"
-REUSE_POSES = True        # False re-runs pose instead of using the cache
 
 # Pose runs on every decoded frame either way; video_fps is the *detector*
 # cadence and reaches stride 1 once it is >= the decoded rate. A hand arriving
@@ -190,6 +311,16 @@ POSE_SMOOTH_SIGMA = 2.0
 # ── Touch detection ──────────────────────────────────────────────────────────
 # A limb activates a hold by staying inside it. Dwell rather than a single
 # frame, so a hand swinging past a hold on the way to another one is not a use.
+# The clock starts on both feet clear of the ground with a hand on a hold, held
+# for this long. Its own dwell rather than HOLD_DWELL_SECONDS: this one is
+# measuring a body position against a noisy floor line, not a limb against a
+# mask, and it wants to be shorter.
+START_DWELL_SECONDS = 0.4
+# …and the counter leaks rather than resetting. One frame where ViTPose drops an
+# ankle into the mat costs a frame, not the whole run — otherwise the clock
+# needs START_DWELL_SECONDS of flawless pose, which on a low start it never gets.
+START_DWELL_DECAY = 1
+
 HOLD_DWELL_SECONDS = 0.5
 FINAL_HOLD_DWELL_SECONDS = 0.5    # both wrists on the top hold: the route is done
 FINAL_HOLD_TOUCH_SECONDS = 0.25   # …but the top hold itself confirms on a tap.
@@ -223,9 +354,13 @@ FINAL_DWELL_DECAY = 0             # counter -= this per missed frame, floored at
 # ratio before the test, so a margin means the same distance sideways as it does
 # vertically. (Testing in raw normalized coordinates made every margin an
 # ellipse — on this portrait clip, 1.78x more generous vertically.)
-HOLD_MASK_MARGIN = 0.018      # enter: ~19px at 1080; the mask hugs the hold
-HOLD_RELEASE_MARGIN = 0.030   # stay:  ~32px at 1080; must clear this to let go
-HOLD_BBOX_MARGIN = 0.018      # fallback for a hold with no usable mask
+# In **hold heights** now, not fractions of the frame — see `climb.scales` for
+# why the old unit stopped meaning anything once the canvas replaced the frame.
+# These reproduce the tripod clip's effective tuning: 0.018 of that frame was
+# 0.58 of a hold there, and the same number was 0.92 of a hold here.
+HOLD_MASK_MARGIN = 0.58       # enter: the mask hugs the hold
+HOLD_RELEASE_MARGIN = 0.96    # stay:  must clear this to let go
+HOLD_BBOX_MARGIN = 0.58       # fallback for a hold with no usable mask
 
 # How *close* a contact got, not just how long it lasted. The dwell above asks
 # only how many frames a limb spent inside the margin, which a limb travelling
@@ -244,7 +379,7 @@ HOLD_BBOX_MARGIN = 0.018      # fallback for a hold with no usable mask
 # 0.012 sits in the gap the four attempts leave between the deepest graze
 # (-0.0158) and the shallowest real contact (-0.0088), which is where it should
 # be re-checked if either moves.
-HOLD_GRAZE_DEPTH = 0.012      # ~13px at 1080; closer than this is a real touch
+HOLD_GRAZE_DEPTH = 0.38       # hold heights; closer than this is a real touch
 HOLD_GRAZE_DWELL_SECONDS = 1.5
 
 # COCO-17 has no foot: the ankle keypoint sits at the joint, but the contact is
@@ -252,12 +387,58 @@ HOLD_GRAZE_DWELL_SECONDS = 1.5
 # foot is plainly on it, and a hold just above the ankle activates when nothing
 # is touching it. Shifts ankles down by the offset for the inclusion test only.
 ANKLE_LENIENCY = True
-ANKLE_TO_TOE_OFFSET = 0.02    # fraction of frame height
+# How far below the ankle joint the contact point sits, in **climber heights**.
+# A foot is about this much of a standing person. It used to be a fraction of
+# the frame, which on the canvas came out at nearly a shin — it ate the whole
+# gap between the toe and the mat and stopped the clock ever starting.
+ANKLE_TO_TOE_OFFSET = 0.045
 
 # The four points of contact are defined in src/climb.LIMBS (wrists 9/10,
 # ankles 15/16) — they are what the utilization split is computed over.
 TORSO_KP_INDICES = [5, 6, 11, 12]   # shoulder L/R, hip L/R — the midline centroid
 FINAL_HOLD_WRISTS = [9, 10]         # both wrists must match the top hold
+
+# ── Holds the prompt missed ──────────────────────────────────────────────────
+# A second pass that uses the climber as the prompt. A limb that sits still on
+# the wall for RECOVER_DWELL_SECONDS with nothing under it is evidence of a hold
+# the colour prompt did not find — on this wall, a foothold chalked over until
+# nothing about it reads green. SAM 3.1's `segment_box` is then asked what is
+# inside a box there, and a box prompt has no opinion about colour.
+#
+# Costs one small image call per site, and only runs where there is evidence.
+RECOVER_MISSED_HOLDS = True
+RECOVER_DWELL_SECONDS = 1.2   # longer than an ordinary hold dwell: a smear moves
+RECOVER_MAX_SITES = 6         # most sites to spend a call on, best-dwelt first
+
+# Clustering and exclusion, all in hold heights.
+RECOVER_CLUSTER_RADIUS = 1.0  # samples this close are one site
+# A site this close to a known hold is taken to *be* that hold. It only has to
+# cover sites sitting just outside the contact test, because the release margin
+# (HOLD_RELEASE_MARGIN, 0.96 hold heights) has already excluded everything
+# nearer than that — set it much higher and it swallows the case this pass
+# exists for, which is a missed hold set right beside a found one. On this wall
+# the chalked-over foothold sits 1.27 hold heights from its neighbour.
+RECOVER_NEAR_HOLD = 1.05
+RECOVER_BOX_SIZE = 4.0        # the box put to SAM, centred on the site
+
+# `segment_box` steers on the box but answers with a proposal set over the whole
+# frame — fifty instances at the site, twenty-five for a box in the far corner —
+# so the row is chosen by position rather than by score. These bound that search.
+RECOVER_SEARCH_RADIUS = 0.10  # frame widths; instances further out are not decoded
+RECOVER_SITE_TOLERANCE = 1.0  # hold heights the site may sit outside the outline
+RECOVER_SAME_HOLD_IOU = 0.35  # above this the instance is a hold we already have
+RECOVER_MIN_ON_WALL = 0.25    # a site with less of the route's footprint is not on it
+
+# What comes back has to be hold-shaped. A mask many hold-heights across is the
+# panel behind the hold; a fraction of one is noise. This is the guard against a
+# foot smeared on blank wall inventing a hold.
+RECOVER_MIN_SPAN = 0.35
+RECOVER_MAX_SPAN = 4.0
+
+# Recovered holds are drawn with a dashed outline: they rest on one box-prompted
+# look plus the climber's behaviour, not on a hundred sightings agreeing, and
+# should not be able to hide among the ones that do.
+RECOVERED_DASH = True
 
 # ── Hold numbering ───────────────────────────────────────────────────────────
 # The numbering has to be a property of the wall, not of the climber, or two
@@ -275,6 +456,26 @@ FINAL_HOLD_WRISTS = [9, 10]         # both wrists must match the top hold
 #   "ltr" / "rtl" — force it.
 HOLD_NUMBERING = "auto"
 HOLD_NUMBER_BAND = 0.025      # ~ one hold height; same row if closer than this
+# Below this |lean| there is no lean to read and "auto" uses the fixed default.
+# Without it, auto is a coin toss on a route that runs straight up: this one
+# measured -0.005 over thirteen holds and +0.018 over fourteen, so recovering a
+# single hold near the bottom flipped the sign and renumbered every row.
+HOLD_LEAN_DEADBAND = 0.05
+
+# Align several clips onto one hold numbering so their sequences can be read
+# against each other. The alignment matches holds between clips by position,
+# and each clip builds its own canvas around its own reference frame — so before
+# anything is matched, every clip's wall mosaic is registered onto the first
+# clip's (`camera.register`: the same feature matcher, one more homography) and
+# its holds are carried across. Off a tripod that homography is the identity and
+# this is exactly the old comparison; handheld it is what makes it valid at all.
+#
+# A clip whose wall will not register — shot from somewhere that shares too
+# little of the wall with the first clip — is left out of the comparison with a
+# warning rather than aligned on a guess.
+COMPARE_ATTEMPTS = True
+COMPARE_REGISTER_FEATURES = 6000   # SIFT keypoints per mosaic
+COMPARE_REGISTER_MIN_INLIERS = 60  # below this two walls are not the same wall
 
 # ── Same wall, four attempts ─────────────────────────────────────────────────
 # Comparing sequences across clips only means something if hold 7 is the same
@@ -360,6 +561,35 @@ SKELETON_COLORS = {
 # ── The right panel ──────────────────────────────────────────────────────────
 # The wall with the climber taken away: every hold on the route, dim until it is
 # used and lit in the order it was used, over the path the body took.
+# The backdrop is the wall canvas from src/mosaic.py — the whole boulder, built
+# out of every frame and with the climber medianed away. The tripod version drew
+# the route on black because there was nothing else to draw it on; here there is
+# a photograph of the wall that no single frame of the clip contains.
+#
+# Dimmed, because the panel's subject is the route and not the photograph: at
+# full brightness the lit holds compete with every other hold in the gym.
+# Off by default, which puts the route on black exactly as the tripod version
+# did: the panel's subject is the route, and a photograph of every other hold in
+# the gym competes with it. The mosaic is still built and still written out as
+# `wall.png` and `holds.png`, where checking the segmentation against the real
+# wall is the whole point. Turn it on for a panel that shows the boulder.
+ROUTE_BACKDROP = False
+ROUTE_BACKDROP_DIM = 0.55     # 0 keeps the mosaic at full brightness, 1 is black
+
+# The right panel is framed on the route, not on the whole canvas. The canvas is
+# as big as the camera's wanderings made it — on this clip the boulder is about
+# half of it, with ceiling above and mats below — and drawing all of that on
+# black leaves the route as a small cluster in the middle of an empty panel.
+ROUTE_FRAME_ON_HOLDS = True
+ROUTE_FRAME_MARGIN = 0.10     # of the route's own extent, added on every side
+
+# What the left panel is currently looking at, traced on the canvas. Once the
+# operator has zoomed in, nothing else says which part of the wall the live shot
+# is a detail of.
+DRAW_VIEWPORT = False
+VIEWPORT_COLOR = (150, 150, 150)
+VIEWPORT_THICK = 1
+
 HOLD_INACTIVE_COLOR = (55, 55, 55)   # not yet used
 HOLD_INACTIVE_THICK = 1      # dim: a hint of the shape, not a claim about it
 HOLD_ACTIVE_THICK = 2
@@ -443,7 +673,7 @@ TIMER = True
 TIMER_SIZE = 26
 TIMER_COLOR = (255, 255, 255)
 
-CREDIT_TEXT = None           # drawn under the clock; None omits it
+CREDIT_TEXT = "Jeremy Park"           # drawn under the clock; None omits it
 CREDIT_SIZE = 21
 CREDIT_COLOR = (180, 180, 180)
 

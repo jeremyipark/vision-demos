@@ -18,6 +18,7 @@ import csv
 import json
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +30,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 import config as cfg
-from src import (climb, compare, floor as floor_mod, holds as holds_mod, pose,
+from src import (camera as camera_mod, climb, compare, floor as floor_mod,
+                 holds as holds_mod, mosaic, pose, recover as recover_mod,
                  render, timing, video)
 from src.env import load_api_key
 
@@ -57,9 +59,14 @@ def rel(path: Path) -> Path:
         return path
 
 
-def route_metadata(prompt: str) -> dict:
+def hold_color(label: str) -> str:
+    """The route colour for this clip: its own override, or the global default."""
+    return cfg.HOLD_COLOR_BY_CLIP.get(label, cfg.HOLD_COLOR)
+
+
+def route_metadata(prompt: str, color: str | None = None) -> dict:
     """What problem this is. Recorded into every artifact the run writes."""
-    return {"color": cfg.HOLD_COLOR, "grade": cfg.ROUTE_GRADE,
+    return {"color": color or cfg.HOLD_COLOR, "grade": cfg.ROUTE_GRADE,
             "name": cfg.ROUTE_NAME, "prompt": prompt}
 
 
@@ -100,10 +107,15 @@ class Run:
     export_info: object
     prompt: str
     hold_settings: dict
+    colour: str
+    camera: object
+    wall: object
+    fit: object
     route: list
     numbering: str
     ground: object
     poses: object
+    frame_poses: object
     analysis: object
     util: object
     rows: list
@@ -120,23 +132,39 @@ class Run:
     tonemap_reason: str
     convert_seconds: float = 0.0
     convert_cached: bool = True
+    camera_seconds: float = 0.0
+    camera_cached: bool = True
+    wall_seconds: float = 0.0
+    wall_cached: bool = True
     hold_seconds: float = 0.0
     hold_cost: float = 0.0
     floor_cost: float = 0.0
+    recover_cost: float = 0.0
     upload_mb: float = 0.0
     started: float = 0.0      # perf counter at the top of `analyze`, so the
                               # per-clip metrics cover the analysis too
 
     @property
     def aspect(self) -> float:
-        return self.info.width / self.info.height
+        """Canvas width over canvas height.
 
-    def attempt(self) -> compare.Attempt:
-        """This clip as a row in the comparison."""
+        The canvas, not the frame: every coordinate that leaves `analyze` is in
+        canvas space now, and the aspect is what puts x and y into the same
+        physical unit so a margin means one distance in every direction.
+        """
+        return self.camera.size[0] / self.camera.size[1]
+
+    def attempt(self, holds: list | None = None) -> compare.Attempt:
+        """This clip as a row in the comparison.
+
+        *holds* replaces the route's own positions — `compare_runs` passes them
+        already carried onto the shared wall, since positions on this clip's own
+        canvas mean nothing next to another clip's.
+        """
         return compare.Attempt(
             label=self.label,
             video=self.video.name,
-            holds=self.route,
+            holds=self.route if holds is None else holds,
             sequence=climb.activation_sequence(self.analysis),
             limb_sequence=climb.limb_sequence(self.analysis),
             elapsed=(round(self.analysis.elapsed, 3)
@@ -223,53 +251,208 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     if export_mp4 is not mp4:
         console.print(f"  export    [bold]{export_info}[/]")
 
-    # ── 4. Holds ─────────────────────────────────────────────────────────────
-    rule(4, "The route (SAM 3.1)")
-    prompt = cfg.HOLD_PROMPT.format(color=cfg.HOLD_COLOR)
-    hold_settings = {
-        "sample_frames": cfg.HOLD_SAMPLE_FRAMES, "min_score": cfg.HOLD_MIN_SCORE,
-        "iou": cfg.HOLD_IOU_THRESHOLD, "min_appearance": cfg.HOLD_MIN_APPEARANCE,
-        "raster": cfg.HOLD_RASTER_SIZE, "vote": cfg.HOLD_VOTE_FRACTION,
-        "min_area": cfg.HOLD_MIN_AREA_PX, "fill_holes": cfg.HOLD_FILL_HOLES,
+    # ── 4. The camera ────────────────────────────────────────────────────────
+    rule(4, "Where the camera was pointing")
+    camera_settings = {
+        "reference": cfg.CAMERA_REFERENCE, "probes": cfg.CAMERA_PROBES,
+        "features": cfg.CAMERA_FEATURES, "ratio": cfg.CAMERA_MATCH_RATIO,
+        "ransac": cfg.CAMERA_RANSAC_PX, "min_inliers": cfg.CAMERA_MIN_INLIERS,
+        "smooth": cfg.CAMERA_SMOOTH_SIGMA, "scale": cfg.CAMERA_CANVAS_SCALE,
+        "limit": cfg.CAMERA_CANVAS_LIMIT, "still_px": cfg.CAMERA_STILL_PX,
     }
+    camera_cache = camera_mod.cache_path(mp4, cfg.CACHE_DIR, settings=camera_settings)
+    cached_camera = camera_mod.load_cache(camera_cache) if cfg.REUSE_CAMERA else None
+
+    camera_seconds = 0.0
+    if cached_camera is not None:
+        track, created = cached_camera
+        console.print(f"  [green]cache hit[/]: camera track from [dim]{created}[/]")
+    else:
+        if cfg.REUSE_CAMERA:
+            console.print("  [yellow]no cached track for these settings[/], solving")
+        t0 = time.perf_counter()
+        with console.status("[cyan]checking for camera motion, then matching every "
+                            "frame to the reference[/]…", spinner="dots"):
+            track = camera_mod.track(
+                mp4, reference=cfg.CAMERA_REFERENCE, probes=cfg.CAMERA_PROBES,
+                still_px=cfg.CAMERA_STILL_PX, n_features=cfg.CAMERA_FEATURES,
+                ratio=cfg.CAMERA_MATCH_RATIO, threshold=cfg.CAMERA_RANSAC_PX,
+                min_inliers=cfg.CAMERA_MIN_INLIERS,
+                canvas_scale=cfg.CAMERA_CANVAS_SCALE,
+                canvas_limit=cfg.CAMERA_CANVAS_LIMIT,
+                smooth_sigma=cfg.CAMERA_SMOOTH_SIGMA)
+        camera_seconds = time.perf_counter() - t0
+        camera_mod.save_cache(camera_cache, track,
+                              stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        console.print(f"  [green]done in {camera_seconds:.1f}s[/]")
+
+    how = Counter(track.source)
+    solved = track.inliers[track.inliers > 0]
+    moved = (f"{track.motion:.1f}px" if track.motion is not None
+             and np.isfinite(track.motion) else "unmeasured")
+    kv({
+        "camera": (f"[bold]still[/] — the probes moved at most {moved} "
+                   f"(CAMERA_STILL_PX = {cfg.CAMERA_STILL_PX}); per-frame matching "
+                   f"skipped" if how.get("still") else
+                   f"[bold]moving[/] — the probes moved up to {moved}; every frame "
+                   f"placed on the canvas"),
+        "reference frame": track.reference,
+        "solved": ", ".join(f"{v} {k}" for k, v in how.most_common())
+                  + ("  [dim](direct = matched straight to the reference, so no "
+                     "drift)[/]" if how.get("direct") else ""),
+        "RANSAC inliers": (f"min {int(solved.min())}, median {int(np.median(solved))}, "
+                           f"max {int(solved.max())}") if len(solved) else "—",
+        "canvas": f"{track.size[0]}x{track.size[1]} px "
+                  f"[dim](the frame is {track.frame_size[0]}x{track.frame_size[1]})[/]",
+    }, title="camera")
+    if how.get("filled"):
+        console.print(f"  [yellow]{how['filled']} frames interpolated[/] — too blurred "
+                      "to match anything; lower CAMERA_MIN_INLIERS if there are many")
+
+    # ── 5. The wall ──────────────────────────────────────────────────────────
+    rule(5, "The wall, from every frame at once")
+    wall_settings = {"stride": cfg.WALL_STRIDE, "max": cfg.WALL_MAX_SAMPLES,
+                     "scale": cfg.WALL_SCALE, "sharp": cfg.WALL_SHARPNESS_WEIGHT,
+                     "coverage": cfg.WALL_MIN_COVERAGE, "camera": camera_settings}
+    wall_cache = cfg.CACHE_DIR / (camera_mod.cache_path(
+        mp4, cfg.CACHE_DIR, settings=wall_settings).stem.replace("camera.", "wall.") + ".png")
+    wall_seconds = 0.0
+    box_cache = wall_cache.with_suffix(".json")
+    wall = cv2.imread(str(wall_cache)) if (cfg.REUSE_WALL and wall_cache.is_file()
+                                           and box_cache.is_file()) else None
+    if wall is not None:
+        crop_box = tuple(json.loads(box_cache.read_text()))
+        console.print(f"  [green]cache hit[/]: [dim]{rel(wall_cache)}[/]")
+    else:
+        t0 = time.perf_counter()
+        wall, coverage = mosaic.build(
+            mp4, track, stride=cfg.WALL_STRIDE, scale=cfg.WALL_SCALE,
+            max_samples=cfg.WALL_MAX_SAMPLES,
+            sharpness_weight=cfg.WALL_SHARPNESS_WEIGHT, console=console)
+        wall, coverage, crop_box = mosaic.trim(wall, coverage,
+                                               min_frames=cfg.WALL_MIN_COVERAGE)
+        wall_seconds = time.perf_counter() - t0
+        cfg.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(wall_cache), wall)
+        box_cache.write_text(json.dumps(list(crop_box)))
+        console.print(f"  [green]done in {wall_seconds:.1f}s[/] -> [dim]{rel(wall_cache)}[/]")
+
+    # The canvas is now the trimmed mosaic. Folding the crop into the track
+    # keeps one coordinate system: a hold at canvas (0.5, 0.5) is the middle of
+    # this image, and stays so however the canvas was cut down.
+    track = track.crop(crop_box)
+    console.print(f"  wall image [bold]{wall.shape[1]}x{wall.shape[0]}[/] "
+                  f"[dim](the climber is medianed out of it; this is the right panel)[/]")
+    # The panel is framed once the route is known; until then it is the canvas.
+    fit = mosaic.Fit(track.size, (export_info.width, export_info.height))
+
+    # ── 6. The route ─────────────────────────────────────────────────────────
+    rule(6, "The route (SAM 3.1, tracked)")
+    colour = hold_color(label)
+    prompt = cfg.HOLD_PROMPT.format(color=colour)
+    # One `track` call keeps at most 128 samples and initialises once, so a long
+    # clip is cut into segments rather than having its stride coarsened. See
+    # `holds.segment_plan` — on a clip where the camera walks all the way round,
+    # segmenting is not an optimisation, it is the only way the second half gets
+    # tracked at all.
+    plan = holds_mod.segment_plan(info.n_frames, cfg.HOLD_TRACK_STRIDE,
+                                  max_frames=cfg.HOLD_TRACK_MAX_FRAMES)
+    hold_settings = {"stride": cfg.HOLD_TRACK_STRIDE,
+                     "max_frames": cfg.HOLD_TRACK_MAX_FRAMES,
+                     "min_score": cfg.HOLD_MIN_SCORE, "segments": len(plan)}
     holds_cache = holds_mod.cache_path(mp4, cfg.CACHE_DIR, model=cfg.HOLD_MODEL,
                                        prompt=prompt, settings=hold_settings)
     cached_holds = holds_mod.load_cache(holds_cache) if cfg.REUSE_HOLDS else None
 
-    kv({"model": cfg.HOLD_MODEL, "prompt": f"[bold]{prompt}[/]",
-        "sampled frames": cfg.HOLD_SAMPLE_FRAMES}, title="request")
+    n_samples = sum(-(-length // cfg.HOLD_TRACK_STRIDE) for _, length in plan)
+    kv({"model": cfg.HOLD_MODEL,
+        "method": f"track [dim]({len(plan)} call{'s' if len(plan) > 1 else ''}, "
+                  f"{'segmented' if len(plan) > 1 else 'whole clip'})[/]",
+        "prompt": f"[bold]{prompt}[/]",
+        "sampled": f"every {cfg.HOLD_TRACK_STRIDE} frames — {n_samples} looks, "
+                   f"one every {cfg.HOLD_TRACK_STRIDE / info.fps:.2f}s"},
+       title="request")
 
     hold_seconds = 0.0
+    hold_usage = None
     if cached_holds is not None:
-        route, raw_detections, hold_usages, created = cached_holds
-        console.print(f"  [green]cache hit[/]: holds from [dim]{created}[/] "
+        payload, hold_usage, created = cached_holds
+        console.print(f"  [green]cache hit[/]: tracks from [dim]{created}[/] "
                       f"([dim]{holds_cache.name}[/]); no gateway call")
-        console.print("  [dim]set REUSE_HOLDS = False in config.py to re-segment[/]")
+        console.print("  [dim]set REUSE_HOLDS = False in config.py to re-track[/]")
     else:
         if cfg.REUSE_HOLDS:
-            console.print("  [yellow]no cached holds for these settings[/], calling the gateway")
+            console.print("  [yellow]no cached tracks for these settings[/], "
+                          "calling the gateway")
         client = OpenAI(base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
                         timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
-        frames = holds_mod.sample_frames(mp4, cfg.HOLD_SAMPLE_FRAMES)
+        parts, usages = [], []
         t0 = time.perf_counter()
-        raw_detections, hold_usages = holds_mod.segment_frames(
-            client, frames, model=cfg.HOLD_MODEL, prompt=prompt,
-            min_score=cfg.HOLD_MIN_SCORE, workers=cfg.HOLD_REQUEST_WORKERS,
-            console=console)
+        for n, (start, length) in enumerate(plan):
+            if len(plan) == 1:
+                clip = mp4
+            else:
+                clip = cfg.CACHE_DIR / f"{mp4.stem}.seg{n}_{start}_{length}.mp4"
+                if not clip.is_file():
+                    video.segment(mp4, clip, start_frame=start, n_frames=length,
+                                  fps=info.fps)
+            with console.status(f"[cyan]waiting on the gateway[/]; SAM is tracking "
+                                f"segment {n + 1}/{len(plan)}…", spinner="dots"):
+                part, usage = holds_mod.request_track(
+                    client, model=cfg.HOLD_MODEL,
+                    video_b64=pose.encode_video(clip), prompt=prompt,
+                    skip_frames=cfg.HOLD_TRACK_STRIDE,
+                    max_frames=cfg.HOLD_TRACK_MAX_FRAMES)
+            # Each segment numbers its frames and tracks from scratch, so both
+            # are shifted into the whole clip's space before they are fused.
+            parts.append(holds_mod.shift(part, frame_offset=start,
+                                         track_offset=n * 1000))
+            if usage:
+                usages.append(usage)
+            if len(plan) > 1:
+                items, _ = holds_mod.unwrap(parts[-1])
+                console.print(f"  segment {n + 1}/{len(plan)} "
+                              f"[dim](frames {start}-{start + length - 1})[/]: "
+                              f"{len({i['track_id'] for i in items})} tracks")
         hold_seconds = time.perf_counter() - t0
-        route = holds_mod.consensus(
-            raw_detections, iou_threshold=cfg.HOLD_IOU_THRESHOLD,
-            min_appearance=cfg.HOLD_MIN_APPEARANCE, raster_size=cfg.HOLD_RASTER_SIZE,
-            vote_fraction=cfg.HOLD_VOTE_FRACTION, min_area_px=cfg.HOLD_MIN_AREA_PX,
-            fill_holes=cfg.HOLD_FILL_HOLES)
-        holds_mod.save_cache(holds_cache, route, raw_detections, hold_usages,
+        payload = holds_mod.concat(parts)
+        hold_usage = {"cost": sum(u.get("cost") or 0.0 for u in usages)}
+        holds_mod.save_cache(holds_cache, payload, hold_usage,
                              stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         console.print(f"  [green]done in {hold_seconds:.1f}s[/]")
 
-    # After the cache, not before it: a suppression is a decision about the
-    # holds SAM already returned, so re-tuning it costs nothing and an existing
-    # cache stays valid.
-    n_clustered = len(route)
+    # Everything below the cache is free to re-tune: the reply is what cost a
+    # hundred seconds, and a threshold should not be something you pay to change.
+    sightings = holds_mod.observations(payload, min_score=cfg.HOLD_MIN_SCORE)
+    _, sampled_frames = holds_mod.unwrap(payload)
+    sampled = [int(f["frame_id"]) for f in sampled_frames]
+    n_tracks = len({o.track for o in sightings})
+
+    clusters, rejected = holds_mod.consolidate(
+        sightings, track, sampled, reject_radius=cfg.HOLD_REJECT_RADIUS,
+        min_appearance=cfg.HOLD_MIN_APPEARANCE, min_sightings=cfg.HOLD_MIN_SIGHTINGS)
+    for entry in rejected:
+        if entry.get("reason") == "identity switch":
+            console.print(f"  [yellow]track {entry['track']}[/]: dropped "
+                          f"{entry['dropped']} of {entry['of']} sightings — they land "
+                          f"up to {entry['worst_px']:.0f}px from where that hold sits "
+                          f"on the canvas, so the id changed hands "
+                          f"[dim](HOLD_REJECT_RADIUS = {cfg.HOLD_REJECT_RADIUS})[/]")
+        else:
+            console.print(f"  [dim]track {entry['track']} dropped: seen in only "
+                          f"{entry.get('fraction', 0):.0%} of the frames that could "
+                          f"have seen it[/]")
+
+    clusters, merges = holds_mod.merge(clusters, iou_threshold=cfg.HOLD_MERGE_IOU)
+    for a, b, overlap in merges:
+        console.print(f"  [dim]tracks {a} and {b} are one hold — their canvas "
+                      f"outlines overlap at IoU {overlap:.2f}[/]")
+
+    route = holds_mod.shape(clusters, track, sampled, raster_size=cfg.HOLD_RASTER_SIZE,
+                            vote_fraction=cfg.HOLD_VOTE_FRACTION,
+                            min_area_px=cfg.HOLD_MIN_AREA_PX,
+                            fill_holes=cfg.HOLD_FILL_HOLES)
+    n_voted = len(route)
     route, swallowed = holds_mod.suppress_contained(
         route, max_containment=cfg.HOLD_NMS_CONTAINMENT)
     for small, big, share in swallowed:
@@ -279,16 +462,18 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
                       f"inside a larger hold scoring {big['score']:.2f}; "
                       f"HOLD_NMS_CONTAINMENT = {cfg.HOLD_NMS_CONTAINMENT}[/]")
 
-    per_call = [len(d.items) for d in raw_detections]
-    hold_cost = sum(u.get("cost") or 0.0 for u in hold_usages)
+    hold_cost = float((hold_usage or {}).get("cost") or 0.0)
+    drifts = [h["drift_px"] for h in route]
     kv({
-        "instances per frame": f"{min(per_call)}-{max(per_call)} "
-                               f"(mean {sum(per_call) / len(per_call):.1f})" if per_call else "—",
-        "holds after consensus": f"[bold]{len(route)}[/] "
-                                 f"(IoU ≥ {cfg.HOLD_IOU_THRESHOLD}, seen in "
-                                 f"≥ {cfg.HOLD_MIN_APPEARANCE:.0%} of samples"
-                                 + (f"; {n_clustered - len(route)} swallowed by a "
-                                    f"larger hold)" if swallowed else ")"),
+        "tracks returned": f"{n_tracks} over {len(sampled)} sampled frames "
+                           f"({len(sightings)} sightings)",
+        "holds on the canvas": f"[bold]{len(route)}[/]"
+                               + (f" ({n_voted - len(route)} swallowed by a "
+                                  f"larger hold)" if swallowed else ""),
+        "canvas agreement": (f"median {np.median(drifts):.1f}px, worst "
+                             f"{max(drifts):.1f}px across the clip "
+                             f"[dim](of a {max(track.size)}px canvas)[/]")
+                            if drifts else "—",
         "cost": f"${hold_cost:.4f}" if hold_cost else "—",
     }, title="response")
 
@@ -297,14 +482,15 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
                       "or lower HOLD_MIN_APPEARANCE in config.py.")
         return None
 
-    # ── 4b. The floor ────────────────────────────────────────────────────────
+    # ── 6b. The floor ────────────────────────────────────────────────────────
     ground = None
     floor_cost = 0.0
     if cfg.DETECT_FLOOR:
-        floor_settings = {"sample_frames": cfg.HOLD_SAMPLE_FRAMES,
+        floor_settings = {"sample_frames": cfg.FLOOR_SAMPLE_FRAMES,
                           "min_score": cfg.FLOOR_MIN_SCORE,
                           "min_area": cfg.FLOOR_MIN_AREA,
-                          "resolution": cfg.FLOOR_EDGE_RESOLUTION}
+                          "resolution": cfg.FLOOR_EDGE_RESOLUTION,
+                          "canvas": camera_settings}
         floor_cache = floor_mod.cache_path(mp4, cfg.CACHE_DIR, model=cfg.HOLD_MODEL,
                                            prompt=cfg.FLOOR_PROMPT,
                                            settings=floor_settings)
@@ -315,26 +501,31 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
         else:
             client = OpenAI(base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
                             timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
-            sampled = holds_mod.sample_frames(mp4, cfg.HOLD_SAMPLE_FRAMES)
-            ground, floor_usages = floor_mod.segment(
-                client, sampled, model=cfg.HOLD_MODEL, prompt=cfg.FLOOR_PROMPT,
+            stills = holds_mod.sample_frames(mp4, cfg.FLOOR_SAMPLE_FRAMES)
+            per_frame, floor_usages = floor_mod.segment(
+                client, stills, model=cfg.HOLD_MODEL, prompt=cfg.FLOOR_PROMPT,
                 resolution=cfg.FLOOR_EDGE_RESOLUTION, min_score=cfg.FLOOR_MIN_SCORE,
-                min_area=cfg.FLOOR_MIN_AREA, workers=cfg.HOLD_REQUEST_WORKERS,
+                min_area=cfg.FLOOR_MIN_AREA, workers=cfg.FLOOR_REQUEST_WORKERS,
                 console=console)
+            # On the canvas, so the ground line is attached to the gym rather
+            # than to the lens — see `consensus_canvas`.
+            ground = floor_mod.consensus_canvas(
+                per_frame, [i for i, _ in stills], track,
+                resolution=cfg.FLOOR_EDGE_RESOLUTION, min_score=cfg.FLOOR_MIN_SCORE,
+                min_area=cfg.FLOOR_MIN_AREA, min_support=cfg.FLOOR_MIN_SUPPORT)
             floor_mod.save_cache(floor_cache, ground, floor_usages,
                                  stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         floor_cost = sum(u.get("cost") or 0.0 for u in floor_usages)
         if ground is not None:
             lo, hi = float(np.nanmin(ground.edge)), float(np.nanmax(ground.edge))
-            console.print(f"  floor line at y [bold]{lo:.3f}-{hi:.3f}[/] "
-                          f"([dim]{cfg.FLOOR_PROMPT!r}; slopes "
-                          f"{(hi - lo) * export_info.height:.0f}px across frame[/])")
+            console.print(f"  floor line at canvas y [bold]{lo:.3f}-{hi:.3f}[/] "
+                          f"([dim]{cfg.FLOOR_PROMPT!r}[/])")
         else:
             console.print(f"  [yellow]no floor found[/] for {cfg.FLOOR_PROMPT!r}; "
                           "the start rule falls back to both feet on holds")
 
     # ── 5. Pose ──────────────────────────────────────────────────────────────
-    rule(5, "The climber (ViTPose)")
+    rule(7, "The climber (ViTPose)")
     video_b64, extra_body = pose.build_request(
         mp4, every_frame=cfg.EVERY_FRAME, fps=info.fps, n_frames=info.n_frames,
         video_fps=cfg.VIDEO_FPS, video_max_frames=cfg.VIDEO_MAX_FRAMES,
@@ -389,25 +580,35 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     items, returned_frames = pose.unwrap(payload)
 
     # Which body is the climber, decided once against the route's own footprint.
-    wall = holds_mod.wall_mask(route, res=cfg.WALL_MASK_RES, dilate=cfg.WALL_MASK_DILATE)
+    # The footprint is on the canvas, so the boxes being scored have to be too —
+    # otherwise the test asks whether a person was where the *camera* pointed.
+    wall_region = holds_mod.wall_mask(route, res=cfg.WALL_MASK_RES,
+                                      dilate=cfg.WALL_MASK_DILATE)
     track_id, track_stats = pose.pick_track(
-        items, mask=wall, overlap_fn=holds_mod.wall_overlap,
+        pose.project_boxes(items, track), mask=wall_region,
+        overlap_fn=holds_mod.wall_overlap,
         min_overlap=cfg.MIN_WALL_OVERLAP, lock_to_wall=cfg.LOCK_TO_WALL)
-    poses = pose.resolve(items, returned_frames, track_id,
-                         min_kpt_score=cfg.POSE_MIN_KPT_SCORE)
-    poses = pose.smooth(poses, sigma=cfg.POSE_SMOOTH_SIGMA)
+    frame_poses = pose.resolve(items, returned_frames, track_id,
+                               min_kpt_score=cfg.POSE_MIN_KPT_SCORE)
+    # Onto the canvas, and only then smoothed. In frame coordinates a hand
+    # locked onto a hold still slides across the image as the camera pans, so
+    # smoothing there would filter the camera's motion into the body's.
+    poses = pose.smooth(pose.project(frame_poses, track), sigma=cfg.POSE_SMOOTH_SIGMA)
 
     coverage = poses.n_frames_returned / info.n_frames if info.n_frames else 0
     kv({
         "frames returned": f"{poses.n_frames_returned} of {info.n_frames} source ({coverage:.0%})",
-        "tracks seen": ", ".join(
+        "tracks seen": (lambda ranked: ", ".join(
             f"{t}{' [bold](climber)[/]' if t == track_id else ''} "
-            f"[dim]({s['coverage']:.0%} of frames, {s['mean_overlap']:.2f} on-wall)[/]"
-            for t, s in sorted(track_stats.items(), key=lambda kv: -kv[1]["coverage"])) or "none",
+            f"[dim]({st['coverage']:.0%} of frames, {st['mean_overlap']:.2f} "
+            f"on-wall)[/]" for t, st in ranked[:6])
+            + (f" [dim]… and {len(ranked) - 6} more[/]" if len(ranked) > 6 else "")
+        )(sorted(track_stats.items(), key=lambda kv: -kv[1]["coverage"])) or "none",
         "frames with the climber": poses.n_posed,
         "joint confidence": (f"≥ {cfg.POSE_MIN_KPT_SCORE}" if cfg.POSE_MIN_KPT_SCORE
                              else "off (the (0, 0) sentinel alone)"),
-        "smoothing": f"σ = {cfg.POSE_SMOOTH_SIGMA} frames" if cfg.POSE_SMOOTH_SIGMA else "off",
+        "smoothing": (f"σ = {cfg.POSE_SMOOTH_SIGMA} frames, on the canvas"
+                      if cfg.POSE_SMOOTH_SIGMA else "off"),
         "usage": pose_usage or "—",
     }, title="response")
 
@@ -433,16 +634,81 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
                           f"climber's own reach (HOLD_SPATIAL_MARGIN = "
                           f"{cfg.HOLD_SPATIAL_MARGIN})[/]")
     route, numbering = holds_mod.assign_ids(
-        route, band=cfg.HOLD_NUMBER_BAND, direction=cfg.HOLD_NUMBERING)
+        route, band=cfg.HOLD_NUMBER_BAND, direction=cfg.HOLD_NUMBERING,
+        deadband=cfg.HOLD_LEAN_DEADBAND)
+    # ── 6. The climb ─────────────────────────────────────────────────────────
+    rule(8, "The climb")
+    # Canvas coordinates throughout: the holds, the keypoints and the ground
+    # line. The aspect is the canvas's, which is what makes HOLD_MASK_MARGIN one
+    # distance on the wall instead of one fraction of whatever the camera was
+    # framing at that moment.
+    aspect = track.size[0] / track.size[1]
+    analysis = climb.analyze(route, poses, fps=info.fps, aspect=aspect, cfg=cfg,
+                             floor=ground)
+    # ── 8b. Holds the prompt missed ──────────────────────────────────────────
+    # Run against the finished climb rather than before it, for two reasons: the
+    # window between pulling on and topping out is the only stretch where a
+    # resting limb means anything (a hand on the summit afterwards is not on a
+    # hold), and "which limbs found nothing" is a question about the analysis.
+    # Anything recovered changes the route, so the route is renumbered and the
+    # climb is read again — cheap, it is one pass over the frames in memory.
+    recovered: list[dict] = []
+    recover_cost = 0.0
+    if cfg.RECOVER_MISSED_HOLDS:
+        hold_unit, body_unit = climb.scales(route, poses)
+        geometry = climb.HoldGeometry(route, aspect=track.size[0] / track.size[1],
+                                      bbox_margin=cfg.HOLD_BBOX_MARGIN * hold_unit)
+        sites = recover_mod.candidates(
+            poses, route, geometry, fps=info.fps, cfg=cfg, hold_unit=hold_unit,
+            toe_offset=cfg.ANKLE_TO_TOE_OFFSET * body_unit,
+            wall=holds_mod.wall_mask(route, res=cfg.WALL_MASK_RES,
+                                     dilate=cfg.WALL_MASK_DILATE),
+            window=(analysis.start_frame, analysis.completion_frame))
+        if sites:
+            console.print(f"  [dim]{len(sites)} place(s) on the wall where a limb "
+                          f"rested with no hold under it; box-prompting SAM there[/]")
+            client = OpenAI(base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
+                            timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
+            recovered, refused, usages = recover_mod.recover(
+                client, mp4, sites, poses, track, model=cfg.HOLD_MODEL,
+                hold_unit=hold_unit, aspect=track.size[0] / track.size[1],
+                route=route, cfg=cfg, console=console)
+            recover_cost = sum(u.get("cost") or 0.0 for u in usages)
+            for entry in refused:
+                console.print(f"  [dim]site {entry['site']} rejected: {entry['reason']}[/]")
+        else:
+            console.print("  [dim]no unexplained resting places: every limb that "
+                          "stopped on the wall inside the climb had a hold under it[/]")
+
+    if recovered:
+        route = route + recovered
+        route, swallowed_again = holds_mod.suppress_contained(
+            route, max_containment=cfg.HOLD_NMS_CONTAINMENT)
+        for small, big, share in swallowed_again:
+            if small.get("recovered"):
+                console.print(f"  [dim]a recovered hold was {share:.0%} inside an "
+                              f"existing one; dropped[/]")
+        route, numbering = holds_mod.assign_ids(
+            route, band=cfg.HOLD_NUMBER_BAND, direction=cfg.HOLD_NUMBERING,
+            deadband=cfg.HOLD_LEAN_DEADBAND)
+        console.print(f"  [bold]re-reading the climb[/] against "
+                      f"{len(route)} holds")
+        analysis = climb.analyze(route, poses, fps=info.fps, aspect=aspect,
+                                 cfg=cfg, floor=ground)
+        frames = poses.frames()
+
+    if cfg.ROUTE_FRAME_ON_HOLDS:
+        fit = mosaic.Fit.on_holds(track.size, (export_info.width, export_info.height),
+                                  route, margin=cfg.ROUTE_FRAME_MARGIN)
+
+    lean = holds_mod.route_lean(route)
     console.print(f"  [dim]numbered bottom to top, "
                   f"{'left to right' if numbering == 'ltr' else 'right to left'} "
-                  f"within a row (lean {holds_mod.route_lean(route):+.2f}"
-                  f"{', forced' if cfg.HOLD_NUMBERING != 'auto' else ''})[/]")
+                  f"within a row (lean {lean:+.3f}"
+                  + (", forced" if cfg.HOLD_NUMBERING != "auto"
+                     else f", |lean| < {cfg.HOLD_LEAN_DEADBAND} so the default"
+                     if abs(lean) <= cfg.HOLD_LEAN_DEADBAND else "") + ")[/]")
 
-    # ── 6. The climb ─────────────────────────────────────────────────────────
-    rule(6, "The climb")
-    analysis = climb.analyze(route, poses, fps=info.fps,
-                             aspect=info.width / info.height, cfg=cfg, floor=ground)
     # The utilization window is the climb itself, so warm-up touches before the
     # clock started are not counted into the split.
     frames = poses.frames()
@@ -508,18 +774,52 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     return Run(
         video=source, label=label, run_dir=run_dir, src_info=src_info, mp4=mp4,
         info=info, export_mp4=export_mp4, export_info=export_info, prompt=prompt,
-        hold_settings=hold_settings, route=route, numbering=numbering, ground=ground,
-        poses=poses, analysis=analysis, util=util, rows=rows, warmup=warmup,
+        hold_settings=hold_settings, colour=colour, camera=track, wall=wall, fit=fit,
+        route=route, numbering=numbering, ground=ground,
+        poses=poses, frame_poses=frame_poses, analysis=analysis, util=util,
+        rows=rows, warmup=warmup,
         window=window, extra_body=extra_body, track_id=track_id,
         track_stats=track_stats, request_timing=request_timing, pose_usage=pose_usage,
         holds_cached=cached_holds is not None, poses_cached=cached_poses is not None,
         tonemap=tonemap, tonemap_reason=tonemap_reason,
         convert_seconds=convert_seconds, convert_cached=convert_cached,
+        camera_seconds=camera_seconds, camera_cached=cached_camera is not None,
+        wall_seconds=wall_seconds, wall_cached=wall_seconds == 0.0,
         hold_seconds=hold_seconds, hold_cost=hold_cost, floor_cost=floor_cost,
+        recover_cost=recover_cost,
         upload_mb=upload_mb, started=t_run)
 
 
 # ── the comparison ───────────────────────────────────────────────────────────
+
+def _onto_wall(run: Run, anchor: Run, matrix: np.ndarray, unit: float) -> list[dict]:
+    """*run*'s holds on *anchor*'s wall, in *anchor* frame heights on both axes.
+
+    *matrix* maps *run*'s wall mosaic onto *anchor*'s, in mosaic pixels. Copies,
+    not the route itself: the clip keeps drawing on its own canvas, and only the
+    comparison needs to see every clip in one place.
+    """
+    src = np.array(run.wall.shape[1::-1], dtype=float)          # (w, h) px
+    dst = np.array(anchor.wall.shape[1::-1], dtype=float)
+    per_px = np.array(anchor.camera.size, dtype=float) / dst    # canvas px per wall px
+
+    def carry(points):
+        pts = (np.asarray(points, dtype=float).reshape(-1, 1, 2) * src)
+        out = cv2.perspectiveTransform(pts, matrix).reshape(-1, 2)
+        return out * per_px / unit
+
+    moved = []
+    for hold in run.route:
+        polygon = hold.get("polygon") or []
+        if len(polygon) < 3:
+            x, y, w, h = hold["bbox"]
+            polygon = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        pts = carry(polygon)
+        (x0, y0), (x1, y1) = pts.min(axis=0), pts.max(axis=0)
+        moved.append({**hold, "polygon": pts.tolist(),
+                      "bbox": [float(x0), float(y0), float(x1 - x0), float(y1 - y0)]})
+    return moved
+
 
 def compare_runs(runs: list[Run]) -> compare.Comparison | None:
     """Put every attempt into one numbering, and say where the walls disagree.
@@ -527,14 +827,57 @@ def compare_runs(runs: list[Run]) -> compare.Comparison | None:
     This is the step that makes "1 2 5 8" from one clip mean the same thing as
     "1 2 5 8" from another. Without it the numbers are four private languages
     that happen to share an alphabet.
+
+    The alignment matches holds between clips by position, and each clip builds
+    its *own* canvas around its own reference frame — so positions are carried
+    onto one shared wall first. Every clip's mosaic is registered onto the first
+    clip's (`camera.register`), and its holds ride that homography across. Off a
+    tripod the homography is the identity and this is the comparison as it always
+    was; handheld it is what makes positions on two canvases comparable at all.
+
+    The shared unit is the first clip's *frame* height, not its canvas height, so
+    HOLD_MATCH_DISTANCE keeps meaning what it says however far the camera roamed.
     """
     if len(runs) < 2:
         return None
 
-    rule(7, "The same route, four ways")
+    rule(9, "The same route, several ways")
+    if not cfg.COMPARE_ATTEMPTS:
+        console.print("  [dim]off (COMPARE_ATTEMPTS = False); the clips are "
+                      "analyzed separately[/]")
+        return None
+
+    anchor = runs[0]
+    unit = anchor.camera.frame_size[1] * cfg.CAMERA_CANVAS_SCALE
+    attempts = []
+    for run in runs:
+        if run is anchor:
+            matrix, inliers = np.eye(3), None
+        else:
+            with console.status(f"[cyan]registering {run.label}'s wall onto "
+                                f"{anchor.label}'s[/]…", spinner="dots"):
+                matrix, inliers = camera_mod.register(
+                    run.wall, anchor.wall, n_features=cfg.COMPARE_REGISTER_FEATURES,
+                    ratio=cfg.CAMERA_MATCH_RATIO, threshold=cfg.CAMERA_RANSAC_PX,
+                    min_inliers=cfg.COMPARE_REGISTER_MIN_INLIERS)
+            if matrix is None:
+                console.print(f"  [yellow]{run.label} left out of the comparison:[/] "
+                              f"its wall shares only {inliers} matches with "
+                              f"{anchor.label}'s (COMPARE_REGISTER_MIN_INLIERS = "
+                              f"{cfg.COMPARE_REGISTER_MIN_INLIERS}), so its holds "
+                              f"cannot be placed on the same wall")
+                continue
+            console.print(f"  [dim]{run.label}: wall registered onto {anchor.label}'s "
+                          f"({inliers} inliers)[/]")
+        attempts.append(run.attempt(holds=_onto_wall(run, anchor, matrix, unit)))
+
+    if len(attempts) < 2:
+        console.print("  [yellow]nothing left to compare against[/]")
+        return None
+
     comparison = compare.build(
-        [run.attempt() for run in runs],
-        aspect=runs[0].aspect,
+        attempts,
+        aspect=1.0,           # both axes are already in frame heights
         max_distance=cfg.HOLD_MATCH_DISTANCE,
         drift_warn=cfg.HOLD_DRIFT_WARN,
         align_ids=cfg.ALIGN_HOLD_IDS,
@@ -630,6 +973,10 @@ def deliver(run: Run, comparison: compare.Comparison | None, *, step: int,
             batch: bool) -> Path:
     """Steps 8-10 for one clip: render it, then write everything it produced."""
     rule(step, f"Render{f' — [bold]{run.label}[/]' if batch else ''}")
+    # A clip whose wall would not register was left out of the comparison, and
+    # has nothing to end on: its card would be every other attempt and not it.
+    if comparison is not None and comparison.by_label(run.label) is None:
+        comparison = None
     run_dir = run.run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
     analysis, info, export_info = run.analysis, run.info, run.export_info
@@ -638,26 +985,35 @@ def deliver(run: Run, comparison: compare.Comparison | None, *, step: int,
     # until every clip has been read and the numbering chosen.
     (run_dir / "holds.json").write_text(json.dumps(run.route, indent=2))
 
-    if cfg.SAVE_HOLDS_PREVIEW:
-        cap = cv2.VideoCapture(str(run.export_mp4))
-        ok, first = cap.read()
-        cap.release()
-        if ok:
-            preview = run_dir / "holds.png"
-            color = cfg.HOLD_RENDER_COLOR.get(cfg.HOLD_COLOR, cfg.HOLD_COLOR_FALLBACK)
-            cv2.imwrite(str(preview), render.holds_preview(
-                first, run.route, color, scale=export_info.width / 608.0))
-            console.print(f"  holds  -> [dim]{rel(preview)}[/]")
+    if cfg.SAVE_HOLDS_PREVIEW and run.wall is not None:
+        # On the wall canvas, not on a frame. The first frame of a handheld clip
+        # shows whatever the operator happened to be pointing at; the canvas
+        # shows the whole boulder, so "did the prompt find the right route" is a
+        # question this image can actually answer.
+        color = cfg.HOLD_RENDER_COLOR.get(run.colour, cfg.HOLD_COLOR_FALLBACK)
+        preview = run_dir / "holds.png"
+        cv2.imwrite(str(preview), render.holds_preview(
+            run.wall, run.route, color, scale=run.wall.shape[1] / 608.0))
+        console.print(f"  holds  -> [dim]{rel(preview)}[/] "
+                      f"[dim](the canvas, with the route on it)[/]")
+        wall_path = run_dir / "wall.png"
+        cv2.imwrite(str(wall_path), run.wall)
+        console.print(f"  wall   -> [dim]{rel(wall_path)}[/]")
 
-    route_points = climb.route_path(analysis, export_info.width, export_info.height,
-                                    sigma=cfg.ROUTE_SPLINE_SIGMA)
+    # In canvas pixels: the route line is a line on the wall, and the renderer
+    # places it into the panel itself.
+    route_points = climb.route_path(analysis, sigma=cfg.ROUTE_SPLINE_SIGMA)
 
     raw_pair = run_dir / "_pair.mp4"
     raw_solo = run_dir / "_solo.mp4" if cfg.SAVE_RIGHT_PANEL else None
     t0 = time.perf_counter()
     stats = render.render(export_info, run.route, run.poses, analysis, route_points,
-                          raw_pair, cfg=cfg, console=console, right_path=raw_solo,
-                          ground=run.ground, comparison=comparison, label=run.label)
+                          raw_pair,
+                          cfg=cfg, console=console, camera=run.camera,
+                          wall=run.wall, fit=run.fit, frame_poses=run.frame_poses,
+                          colour=run.colour,
+                          right_path=raw_solo, ground=run.ground,
+                          comparison=comparison, label=run.label)
     render_seconds = time.perf_counter() - t0
     console.print(f"  drew the climber on [bold]{stats['frames_with_pose']}/"
                   f"{stats['frames_written']}[/] frames")
@@ -714,7 +1070,7 @@ def deliver(run: Run, comparison: compare.Comparison | None, *, step: int,
 
     (run_dir / "climb.json").write_text(json.dumps({
         "route": route_metadata(run.prompt),
-        "route_color": cfg.HOLD_COLOR, "prompt": run.prompt, "fps": info.fps,
+        "route_color": run.colour, "prompt": run.prompt, "fps": info.fps,
         "hold_numbering": {"order": "bottom_to_top", "within_row": run.numbering,
                            "band": cfg.HOLD_NUMBER_BAND,
                            "lean": round(holds_mod.route_lean(run.route), 4)},
@@ -760,7 +1116,7 @@ def deliver(run: Run, comparison: compare.Comparison | None, *, step: int,
     }, indent=2))
 
     (run_dir / "summary.txt").write_text(climb.summary_text(
-        analysis, rows, util, source=run.video.name, color=cfg.HOLD_COLOR,
+        analysis, rows, util, source=run.video.name, color=run.colour,
         numbering=run.numbering, warmup=run.warmup))
     console.print(f"  holds.json, poses.json, climb.json, sequence.json, "
                   f"hold_times.csv, limb_usage.csv, summary.txt -> [dim]{rel(run_dir)}/[/]")
@@ -781,18 +1137,20 @@ def deliver(run: Run, comparison: compare.Comparison | None, *, step: int,
     (run_dir / "metrics.txt").write_text(metrics.as_text())
 
     m = metrics.as_dict()
-    total_cost = (pose_cost or 0.0) + run.hold_cost + run.floor_cost
+    total_cost = (pose_cost or 0.0) + run.hold_cost + run.floor_cost + run.recover_cost
     kv({
         "ViTPose throughput": f"[bold green]{m['pose']['fps']:.1f} fps[/]  "
                               f"({m['pose']['ms_per_frame']:.0f} ms/frame, "
                               f"{m['pose']['realtime_factor']:.2f}x realtime)",
-        "SAM 3.1": f"{run.hold_seconds:.1f}s for {cfg.HOLD_SAMPLE_FRAMES} frames"
+        "SAM 3.1": f"{run.hold_seconds:.1f}s tracking the holds"
                    if run.hold_seconds else "cached",
         "gateway round trip": f"{m['gateway_round_trip']['seconds']:.2f}s",
         "render": f"{m['local']['render_seconds']:.2f}s ({m['local']['render_fps']:.1f} fps)",
         "cost": f"${total_cost:.4f}  [dim](pose ${pose_cost or 0:.4f} + "
                 f"holds ${run.hold_cost:.4f}"
-                + (f" + floor ${run.floor_cost:.4f}" if run.floor_cost else "") + ")[/]"
+                + (f" + floor ${run.floor_cost:.4f}" if run.floor_cost else "")
+                + (f" + recovery ${run.recover_cost:.4f}" if run.recover_cost else "")
+                + ")[/]"
                 if total_cost else "—",
     }, title="metrics")
 
@@ -816,7 +1174,8 @@ def deliver(run: Run, comparison: compare.Comparison | None, *, step: int,
                  "from_cache": run.poses_cached, "usage": run.pose_usage},
         "climb": {**analysis.summary(), "numbering": run.numbering,
                   "sequence": sequence},
-        "floor": {"prompt": cfg.FLOOR_PROMPT, "found": run.ground is not None,
+        "floor": {"method": "segmentation", "prompt": cfg.FLOOR_PROMPT,
+                  "found": run.ground is not None,
                   "clearance": cfg.FLOOR_CLEARANCE, "cost_usd": run.floor_cost}
                  if cfg.DETECT_FLOOR else None,
         "utilization": util.as_dict(),
@@ -911,7 +1270,8 @@ def main() -> int:
     comparison = compare_runs(runs)
     if comparison is not None:
         adopt_numbering(runs, comparison)
-    step = 8 if comparison is not None else 7
+    # `analyze` ends on step 8, and `compare_runs` takes 9 when it runs at all.
+    step = 10 if comparison is not None else 9
 
     selected = to_render(runs, console)
     if not selected:

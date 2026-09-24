@@ -16,7 +16,7 @@ for the climber.
 
 1. Clone the [vision-demos](https://github.com/jeremyipark/vision-demos) repo.
 2. Get an API key at [VLM Run](https://app.vlm.run/sign-in) and add it to your `.env`.
-3. Record a video of yourself climbing, with your phone still and the whole route in frame.
+3. Record a video of yourself climbing, on a tripod or with a friend holding the phone.
 4. Send the video to your computer and drop it in `data/input/current/`.
 5. Update `HOLD_COLOR` in [`config.py`](config.py) to match your route.
 6. Create the conda environment and run `python main.py`.
@@ -55,16 +55,21 @@ Catalog gives you access to 22 vision models.
 
 ## Data collection
 
-**tl;dr: keep your phone still using a tripod or a water bottle, and have the
-entire route in frame.**
+**tl;dr: prop your phone on a water bottle, or have a friend film you. Either
+works.**
 
-This rock climbing demo was based on a video taken with a tripod, so it assumes a
-still camera. For best results:
+The camera does not have to be still. Every frame is matched to one reference
+frame and placed on a shared canvas of the wall (see
+[Still or handheld](#still-or-handheld) below), so a friend can pan and zoom to
+follow you up and the route stays pinned to the wall. For best results:
 
-* Have the entire route visible in frame, from the first hold to the last hold.
 * Pick an easy route. For these demo videos, I typically go with a VB or V0.
-* Use a tripod, or simply set your phone on a water bottle. Someone can also
-  hold the camera, but they should try to stay as still as possible.
+* **Still:** use a tripod or set your phone on a water bottle, with the entire
+  route in frame from the first hold to the last.
+* **Handheld:** the person filming should stay on one spot and turn, tilt and
+  zoom to follow you, rather than walk along the wall. Walking introduces
+  parallax that a flat canvas cannot hold. The whole route does not need to be
+  in any single frame, but every hold should be seen at some point in the clip.
 * Try to avoid recording other people, and watch out for anyone who might walk
   through the frame.
 
@@ -77,8 +82,8 @@ still camera. For best results:
 In short, to create the minimal reproducible example of my demo:
 
 1. Go to an easy VB/V0 route.
-2. Put your phone on a water bottle.
-3. Have the entire route in frame.
+2. Put your phone on a water bottle, or hand it to a friend.
+3. Keep the route in view.
 4. Record yourself completing the route.
 5. Trim the video so it starts right before you begin the route and ends right
    after you finish it (this saves on inference time 🙂).
@@ -132,9 +137,35 @@ Drop one in and it behaves like a single run; drop four in and each render ends
 on a card comparing its holds against the other three. Set `BATCH_MODE = False`
 to run one clip, named by `INPUT_VIDEO`.
 
-This is another reason to keep the camera still: holds are detected once per clip
-and reused for every frame of it, and in batch mode the clips are compared to each
-other hold for hold, so the camera should not move within a take or between takes.
+Each clip builds its own canvas of the wall, so before the clips are compared
+hold for hold, every clip's wall is registered onto the first clip's and its
+holds are carried across. Takes filmed from roughly the same spot register
+cleanly. A take that shares too little of the wall with the first one is left
+out of the comparison with a warning.
+
+### Still or handheld
+
+There is no mode to switch. The pipeline solves where the camera was pointing in
+every frame (`src/camera.py`): each frame is matched straight to one reference
+frame, and the homography between them places it on a shared canvas. Holds,
+keypoints and the floor line all live on that canvas. The left panel projects
+the route back into each moving frame, and the right panel draws it on the still
+canvas. A tripod clip is just the case where every homography is the identity,
+and it is detected rather than computed: a dozen frames spread across the clip
+are matched against each other first, and if none of them moved more than
+`CAMERA_STILL_PX`, the per-frame matching is skipped. The console says which
+case your clip was.
+
+The canvas also gives the right panel a photo of the whole boulder with the
+climber medianed out (`wall.png`). Set `ROUTE_BACKDROP = True` to draw the route
+on it instead of on black.
+
+Handheld works because someone standing in one spot and turning to follow a
+climber is a rotating camera, and a homography is exact for rotation. If the
+camera walks along the wall, that no longer holds.
+[`tools/parallax_check.py`](tools/parallax_check.py) measures how well one
+homography explains two frames, split by depth band, so you can tell which kind
+of clip you have.
 
 For how the route is read and the attempts are aligned, see
 [route-reading-explained.md](route-reading-explained.md).
@@ -157,7 +188,8 @@ Otherwise one timestamped directory per run under `data/output/`:
 20260914-231204/
 ├── climbing_climb.mp4   # the pair, side by side, with the original audio
 ├── climbing_route.mp4   # the right panel alone
-├── holds.png            # the detected route on a clean frame; check this first
+├── holds.png            # the detected route on the wall canvas; check this first
+├── wall.png             # every frame stitched into one image, climber removed
 ├── climb.json           # order, timings, per-hold contact, utilization
 ├── hold_times.csv       # one row per hold: order, limbs, timings
 ├── limb_usage.csv       # one row per (limb, hold): seconds and share

@@ -43,8 +43,13 @@ class Floor:
         value = float(self.edge[i])
         return value if np.isfinite(value) else 1.0
 
-    def is_clear(self, x: float, y: float, clearance: float) -> bool:
-        """True when the point sits above the floor by at least *clearance*."""
+    def is_clear(self, x: float, y: float, clearance: float,
+                 frame: int | None = None) -> bool:
+        """True when the point sits above the floor by at least *clearance*.
+
+        *frame* is accepted and ignored: this edge is already in the canvas the
+        whole clip shares, so it does not depend on which frame is asking.
+        """
         return y < self.top_at(x) - clearance
 
     def as_list(self) -> list:
@@ -128,7 +133,11 @@ def consensus(per_frame: list[FrameMasks], *, resolution: int, min_score: float,
 
 def segment(client, frames, *, model: str, prompt: str, resolution: int,
             min_score: float, min_area: float, workers: int, console=None):
-    """Segment the floor on the sampled frames and reduce them to one edge."""
+    """Segment the floor on the sampled stills. ``(per-frame results, usages)``.
+
+    Stops short of the reduction, which is the caller's choice now: a fixed
+    camera wants :func:`consensus`, a moving one :func:`consensus_canvas`.
+    """
     from .holds import segment_frames
 
     per_frame, usages = segment_frames(
@@ -138,20 +147,110 @@ def segment(client, frames, *, model: str, prompt: str, resolution: int,
         counts = [len(f.items) for f in per_frame]
         console.print(f"  floor: {sum(1 for c in counts if c)}/{len(counts)} frames "
                       f"returned a mask")
-    return consensus(per_frame, resolution=resolution, min_score=min_score,
-                     min_area=min_area), usages
+    return per_frame, usages
 
 
-def draw(frame, floor: Floor, *, color, thickness: int):
-    """The floor line, so the rule the clock uses is visible rather than implied."""
+def consensus_canvas(per_frame: list[FrameMasks], indices: list[int], camera, *,
+                     resolution: int, min_score: float, min_area: float,
+                     min_support: int = 3) -> Floor | None:
+    """One floor edge in *canvas* columns, from stills shot at different angles.
+
+    The frame-space version below assumes the floor sits at the same pixels in
+    every sample, which a tripod guarantees and a pan does not: averaging those
+    edges together handheld would smear the mat line across a third of the
+    image. So each frame's edge is turned back into points, carried onto the
+    canvas by that frame's homography, and the median is taken per *canvas*
+    column instead.
+
+    The result is a ground line attached to the wall rather than to the lens,
+    which is what the start rule wanted all along — "both feet clear of the
+    floor" is a fact about the gym.
+    """
+    columns: list[list[float]] = [[] for _ in range(resolution)]
+    for index, result in zip(indices, per_frame):
+        if index >= camera.n_frames:
+            continue
+        mask = _best_mask(result, min_score=min_score, min_area=min_area)
+        if mask is None:
+            continue
+        edge = _edge_from_mask(mask, resolution)
+        finite = np.isfinite(edge)
+        if not finite.any():
+            continue
+        xs = np.linspace(0.0, 1.0, resolution)[finite]
+        points = camera.to_canvas(np.stack([xs, edge[finite]], axis=1), index)
+        for cx, cy in points:
+            if 0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0:
+                columns[min(resolution - 1, int(cx * (resolution - 1)))].append(float(cy))
+
+    # A canvas column only counts once a few different frames have put floor in
+    # it. The outermost columns of the canvas are at the edge of what any camera
+    # saw, so one frame's noisy last pixel would otherwise anchor the whole line
+    # and hang a spur off each end of it.
+    median = np.array([np.median(c) if len(c) >= min_support else np.nan
+                       for c in columns], dtype=np.float32)
+    finite = np.flatnonzero(np.isfinite(median))
+    if not len(finite):
+        return None
+
+    # Gaps *between* observed columns are filled — a foot over one of those is
+    # still measured against something. Columns beyond the ends are not: no
+    # camera ever saw floor out there, and extending the last known value across
+    # the rest of the canvas would draw a confident ground line through a part
+    # of the gym nothing in this clip looked at.
+    inner = np.arange(finite[0], finite[-1] + 1)
+    filled = np.full(resolution, np.nan, dtype=np.float32)
+    filled[inner] = np.interp(inner, finite, median[finite])
+    return Floor(filled)
+
+
+def _best_mask(result: FrameMasks, *, min_score: float, min_area: float):
+    """The biggest instance in a frame, as a boolean mask, or None.
+
+    The floor is the big low thing, so the biggest instance wins and a stray
+    patch of grey wall cannot stand in for it. ``area`` is the mask's own share
+    of the frame, which is the honest measure — a floor seen edge-on fills a
+    wide, shallow box far larger than the mat inside it — with the box as the
+    fallback for a reply that omits it.
+    """
+    usable = [i for i in result.items
+              if float(i.get("score") or 0.0) >= min_score
+              and i.get("instance_id") is not None]
+    if not usable:
+        return None
+
+    def size(instance):
+        if instance.get("area") is not None:
+            return float(instance["area"])
+        _, _, w, h = instance["bbox_xywh"]
+        return float(w * h)
+
+    best = max(usable, key=size)
+    if size(best) < min_area:
+        return None
+    return instance_mask(decode_label_map(result.mask), best)
+
+
+def draw(frame, floor: Floor, *, color, thickness: int, transform=None):
+    """The floor line, so the rule the clock uses is visible rather than implied.
+
+    *transform* maps the line's normalized coordinates into the panel's before
+    it is drawn — the canvas `Fit` for the right panel, or the camera's own
+    projection into this frame for the left.
+    """
     if floor is None:
         return frame
     h, w = frame.shape[:2]
-    points = []
-    for x in range(w):
-        y = floor.top_at(x / max(w - 1, 1))
-        if y < 1.0:
-            points.append((x, int(round(y * h))))
+    xs = np.linspace(0.0, 1.0, max(2, w))
+    ys = np.array([floor.top_at(x) for x in xs])
+    keep = ys < 1.0
+    if keep.sum() < 2:
+        return frame
+    pts = np.stack([xs[keep], ys[keep]], axis=1)
+    if transform is not None:
+        pts = np.asarray(transform(pts))
+    points = [(int(round(px * w)), int(round(py * h))) for px, py in pts
+              if -0.5 <= px <= 1.5 and -0.5 <= py <= 1.5]
     if len(points) > 1:
         cv2.polylines(frame, [np.array(points, dtype=np.int32)], False, color,
                       thickness, cv2.LINE_AA)

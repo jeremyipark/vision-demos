@@ -226,6 +226,25 @@ def convert(
     tmp.replace(dst)   # atomic: a killed run never leaves a half-file in the cache
 
 
+def segment(src: Path, dst: Path, *, start_frame: int, n_frames: int, fps: float,
+            crf: int = 20) -> None:
+    """Cut frames ``[start_frame, start_frame + n_frames)`` into their own MP4.
+
+    Re-encoded rather than stream-copied. A copy can only cut on a keyframe, and
+    every frame index downstream — SAM's `frame_id`, the camera track, the pose
+    — is counted from the start of the file, so a segment that silently began
+    three frames early would put the whole route three frames out of step.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(".partial.mp4")
+    _run([tool("ffmpeg"), "-y", "-loglevel", "error",
+          "-ss", f"{start_frame / fps:.6f}", "-i", str(src),
+          "-frames:v", str(int(n_frames)),
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+          "-pix_fmt", "yuv420p", "-an", str(tmp)])
+    tmp.replace(dst)
+
+
 def inspect(path: Path) -> VideoInfo:
     """Read geometry the way the renderer will, i.e. through OpenCV."""
     import cv2
