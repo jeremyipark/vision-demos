@@ -13,7 +13,9 @@ holds and
 for the climber's pose. The 3D work runs locally.
 
 <p align="center">
-  <img src="readme_images/rock_climbing_3d_demo_thumbnail.jpg" width="600" alt="A finished climbing route reconstructed in 3D from iPhone LiDAR, with the holds used numbered in order and the route measured in meters">
+  <a href="https://www.youtube.com/watch?v=vjItC11jF0o"><img src="https://img.youtube.com/vi/vjItC11jF0o/maxresdefault.jpg" width="600" alt="A climbing route reconstructed in 3D from iPhone LiDAR, with the holds used numbered in order and the route measured in meters. Click to watch on YouTube."></a>
+  <br>
+  <a href="https://www.youtube.com/watch?v=vjItC11jF0o">▶ Watch on YouTube</a>
 </p>
 
 For a regular video without depth, use [`rock_climbing`](../rock_climbing/).
@@ -69,6 +71,12 @@ In theory, it should work with other depth sensors (e.g. a RealSense).
 Every setting is in [`config.py`](config.py), with an explanation beside it.
 The detailed rules, and what to change when something looks wrong, are in
 [route-reading-explained.md](route-reading-explained.md).
+
+<p align="center">
+  <img src="readme_images/rock_climbing_3d_demo_thumbnail.jpg" width="600" alt="A finished climbing route reconstructed in 3D from iPhone LiDAR, with the holds used numbered in order and the route measured in meters">
+  <br>
+  <em>Final visualization showing the holds used and the real-world distances in meters.</em>
+</p>
 
 ## Output
 
