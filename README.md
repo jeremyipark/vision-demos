@@ -16,7 +16,7 @@ Real-world computer vision demos.
 <p align="center">
   <a href="https://www.youtube.com/watch?v=vjItC11jF0o"><img src="https://img.youtube.com/vi/vjItC11jF0o/maxresdefault.jpg" width="600" alt="A climbing route reconstructed in 3D from iPhone LiDAR, with the holds used numbered in order and the route measured in meters. Click to watch on YouTube."></a>
   <br>
-  <a href="https://www.youtube.com/watch?v=vjItC11jF0o">▶ Watch on YouTube</a> · <a href="rock_climbing_3d/">rock_climbing_3d</a>
+  <a href="https://www.youtube.com/watch?v=vjItC11jF0o">▶ Watch on YouTube</a>
 </p>
 
 ### Dance Sync
