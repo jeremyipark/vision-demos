@@ -1,0 +1,5 @@
+# Clips, caches and outputs stay local; only data/input/.gitkeep is tracked.
+data/*
+!data/input/
+data/input/*
+!data/input/.gitkeep

@@ -1,0 +1,20 @@
+# conda env create -f environment.yml && conda activate basketball
+#
+# HDR clips need a Vulkan device for libplacebo to tone-map on. On macOS that
+# is `conda install -c conda-forge moltenvk`; elsewhere it is the system's own
+# driver. SDR clips need neither.
+name: basketball
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - py-opencv
+  - numpy
+  - matplotlib-base
+  - pillow
+  - rich
+  - python-dotenv
+  - pip
+  - pip:
+      - openai>=1.40

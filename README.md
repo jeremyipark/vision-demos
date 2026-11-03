@@ -12,6 +12,7 @@ Real-world computer vision demos.
 | **[rock_climbing_3d](rock_climbing_3d/)** | Reads the same route from a video recorded with depth (iPhone LiDAR), placing the wall, holds and climber in 3D and measuring the route in meters. | [`sam3.1`](https://vlm.run/gateway/models/facebook-sam3.1) + [`vitpose-plus-large`](https://vlm.run/gateway/models/usyd-community-vitpose-plus-large) |
 | **[running](running/)** | Measures a runner's cadence, times every foot strike, and averages the knee shape at contact. | [`vitpose-plus-large`](https://vlm.run/gateway/models/usyd-community-vitpose-plus-large) |
 | **[deadlift](deadlift/)** | Counts deadlift reps and classifies each rep's back as straight or rounded, with the probability. | [`sam3.1`](https://vlm.run/gateway/models/facebook-sam3.1) + [`vitpose-plus-large`](https://vlm.run/gateway/models/usyd-community-vitpose-plus-large) + [`gemma-4-26b-a4b-it`](https://vlm.run/gateway/models/google-gemma-4-26b-a4b-it) |
+| **[basketball](basketball/)** | Calls every shot a make or a miss by following the ball through the rim, and plots each shot on a court from above with the FG%. | [`sam3.1`](https://vlm.run/gateway/models/facebook-sam3.1) + [`vitpose-plus-large`](https://vlm.run/gateway/models/usyd-community-vitpose-plus-large) |
 
 
 ### Rock Climbing 3D
@@ -56,6 +57,12 @@ Real-world computer vision demos.
   <a href="rock_climbing/"><img src="rock_climbing/readme_images/rock_climbing_demo_thumbnail.jpg" width="600" alt="A completed boulder problem: the left panel holds a card comparing this attempt's sequence of holds against three others, the right panel the segmented route with the holds used lit in order"></a>
 </p>
 
+### Basketball
+
+<p align="center">
+  <a href="basketball/"><img src="basketball/readme_images/basketball_demo_thumbnail.jpg" width="600" alt="The 10th shot just after release, with pose, ball and rim overlay; below, the shot chart with 7 of 9 field goals and 78% in its corner"></a>
+</p>
+
 ### Running
 
 <p align="center">
@@ -79,7 +86,7 @@ conda env create -f environment.yml && conda activate vision-demos   # or: pip i
 python app.py                                                        # -> http://127.0.0.1:7860
 ```
 
-Upload a clip, trim it, analyze. No API key needed (anonymous, rate-limited tier); paste a [VLM Run](https://app.vlm.run) key or set `VLMRUN_API_KEY` for higher limits. `rock_climbing_3d` isn't in the app (it needs a LiDAR capture). `push_ups` isn't in the app either. ffmpeg is required.
+Upload a clip, trim it, analyze. No API key needed (anonymous, rate-limited tier); paste a [VLM Run](https://app.vlm.run) key or set `VLMRUN_API_KEY` for higher limits. `rock_climbing_3d` isn't in the app (it needs a LiDAR capture). `push_ups` and `basketball` aren't in the app either. ffmpeg is required.
 
 ## License
 
