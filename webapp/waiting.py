@@ -207,6 +207,9 @@ DEADLIFT_STAGES = (PREPARE, VITPOSE, SAM, REPS,
                    Stage("Waiting for System One", "System One",
                          ("system one", "back position"), True),
                    RENDER)
+BASKETBALL_STAGES = (PREPARE, VITPOSE, SAM,
+                     Stage("Calling makes and misses", "Shots called", ("make or miss",)),
+                     RENDER)
 CLIMBING_STAGES = (
     Stage("Preparing the clips", "Clips prepared",
           ("api key", "source video", "convert", "camera", "wall")),

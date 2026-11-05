@@ -118,8 +118,11 @@ def _draw_credit(panel, font, *, cfg, scale: float, footer: int) -> None:
     panel[:] = np.array(pil)[..., ::-1]
 
 
-def _spread(points, gap: int):
-    """Move dots that would overlap onto a small ring around their spot."""
+def _spread(points, gap: float):
+    """Move dots that would overlap onto a small ring around their spot.
+
+    In court meters, so the dots fall the same way at any export size.
+    """
     out = []
     for p in points:
         if p is None:
@@ -130,7 +133,7 @@ def _spread(points, gap: int):
             out.append(p)
             continue
         for ring in range(1, 6):
-            options = [(int(p[0] + ring * gap * np.cos(a)), int(p[1] + ring * gap * np.sin(a)))
+            options = [(p[0] + ring * gap * np.cos(a), p[1] + ring * gap * np.sin(a))
                        for a in np.linspace(0, 2 * np.pi, 6 * ring, endpoint=False) + np.pi / 2]
             free = [o for o in options if all(np.hypot(o[0] - q[0], o[1] - q[1]) >= gap
                                               for q in placed)]
@@ -208,8 +211,11 @@ class MagmaText:
 class Panel:
     """The court filling the panel, with field goals and FG% in its corner; and the hot streak."""
 
-    def __init__(self, shots, fps: float, width: int, height: int, *, cfg, footer: int = 0):
+    def __init__(self, shots, fps: float, width: int, height: int, *, cfg, footer: int = 0,
+                 show_fg: bool = True):
         from .court import CourtView
+
+        self.show_fg = show_fg   # off for a compilation: its field goals are picked, not earned
 
         self.shots, self.fps, self.hot = shots, fps, cfg.HOT_STREAK
         s = self.s = width / 1280
@@ -227,19 +233,20 @@ class Panel:
         self.origin = (m, top)
         base[top:top + ch, m:m + cw] = self.court.base
         self.r = max(5, int(17 * s))
-        self.spots = _spread([self.court.px(*self.court.clamp(*shot.court_xy))
-                              if shot.court_xy is not None else None for shot in shots],
-                             2 * self.r + int(4 * s))
+        spots = _spread([self.court.clamp(*shot.court_xy) if shot.court_xy is not None else None
+                         for shot in shots], (2 * self.r + int(4 * s)) / self.court.scale)
+        self.spots = [self.court.px(*p) if p is not None else None for p in spots]
 
         # The tallies, in the court's corner outside the arc, sized to the court.
-        t = self.t = s * min(1.0, self.court.scale / 62)
+        t = self.t = min(s, self.court.scale / 83)   # court px per meter, so it holds at any size
         cx, cy = self.court.corner()
         inset = int(24 * t)
         self.value_x = m + cx - inset
         self.label_x = self.value_x - int(220 * t)
         self.rows_y = [top + cy - inset - int(106 * t), top + cy - inset - int(30 * t)]
-        _text(base, [(label, (self.label_x, y), int(23 * t), _rgb(MUTED), "rm")
-                     for label, y in zip(("FIELD GOALS", "FG%"), self.rows_y)], self.font)
+        if show_fg:
+            _text(base, [(label, (self.label_x, y), int(23 * t), _rgb(MUTED), "rm")
+                         for label, y in zip(("FIELD GOALS", "FG%"), self.rows_y)], self.font)
 
         # The hot streak goes on the video, where the eye already is.
         self.magma = MagmaText("HOT STREAK!", int(56 * s), self.font)
@@ -300,7 +307,8 @@ class Panel:
         t = self.t
         big = int(64 * t)
         values = (f"{made}/{len(done)}", f"{made / len(done):.0%}" if done else "—")
-        items = [(v, (self.value_x, y), big, _rgb(FG), "rm") for v, y in zip(values, self.rows_y)]
+        items = ([(v, (self.value_x, y), big, _rgb(FG), "rm") for v, y in zip(values, self.rows_y)]
+                 if self.show_fg else [])
 
         # A dot per decided shot, numbered, the newest ringed for a moment.
         ox, oy = self.origin

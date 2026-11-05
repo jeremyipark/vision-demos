@@ -63,6 +63,19 @@ def client(api_key: str):
                   timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
 
 
+def new_run_dir(kind: str) -> Path:
+    """A fresh ``data/output/<timestamp>-<kind>/``: e.g. ``20261105-143012-shot-chart``.
+    A second run in the same second gets ``-2``, ``-3``, ..."""
+    stamp = datetime.now().strftime(cfg.RUN_STAMP_FORMAT)
+    run_dir = cfg.OUTPUT_DIR / f"{stamp}-{kind}"
+    n = 2
+    while run_dir.exists():
+        run_dir = cfg.OUTPUT_DIR / f"{stamp}-{kind}-{n}"
+        n += 1
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
 def cost_of(usage: dict | None) -> float:
     return float((usage or {}).get("cost") or 0)
 
@@ -319,20 +332,28 @@ def run_clip(api_key: str) -> dict:
 
     # ── 7. Output ────────────────────────────────────────────────────────────
     rule(7, "Render")
-    stamp = datetime.now().strftime(cfg.RUN_STAMP_FORMAT)
-    run_dir = cfg.OUTPUT_DIR / stamp
-    n = 2
-    while run_dir.exists():
-        run_dir = cfg.OUTPUT_DIR / f"{stamp}-{n}"
-        n += 1
+    run_dir = new_run_dir("shot-chart")
     stamp = run_dir.name
-    run_dir.mkdir(parents=True)
 
     angle = shots_mod.elbow_angle(kp, side, min_projected=cfg.ELBOW_MIN_PROJECTED)
     side_on = shots_mod.shoulder_ratio(kp) < cfg.SIDE_ON_MAX_SHOULDER_RATIO
+    # An export taller than the analyzed clip is drawn on a taller copy of the source
+    # (never past the source's own height), so it isn't upscaled.
+    canvas = info
+    clip_h = min(int(cfg.EXPORT_HEIGHT) // 2, src_info["height"]) // 2 * 2
+    if clip_h > info.height:
+        big = video.cache_path(cfg.INPUT_VIDEO, cfg.CACHE_DIR, target_height=clip_h,
+                               trim_seconds=cfg.TRIM_SECONDS, crf=cfg.CONVERT_CRF,
+                               tonemap=tonemap)
+        if not big.is_file() or cfg.FORCE_RECONVERT:
+            video.convert(cfg.INPUT_VIDEO, big, target_height=clip_h,
+                          trim_seconds=cfg.TRIM_SECONDS, crf=cfg.CONVERT_CRF,
+                          total_frames=src_info["n_frames"], console=console, tonemap=tonemap)
+        canvas = video.inspect(big)
     raw = run_dir / "_raw.mp4"
     t0 = time.perf_counter()
-    stats = render.render(info, kp=kp, hoop=hoop, track=track, shots=shots, dst=raw, cfg=cfg,
+    stats = render.render(info, canvas=canvas, kp=kp, hoop=hoop, track=track, shots=shots,
+                          dst=raw, cfg=cfg,
                           console=console)
     render_seconds = time.perf_counter() - t0
     out_video = run_dir / f"{cfg.INPUT_VIDEO.stem}_basketball.mp4"

@@ -33,3 +33,6 @@ data/sessions/
 .idea/
 .vscode/
 *.swp
+
+# Claude Code local config
+.claude/

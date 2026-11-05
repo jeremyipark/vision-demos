@@ -246,6 +246,10 @@ class Demo:
     # the line under the figure.
     stages: tuple = waiting.POSE_STAGES
     wait_caption: str = "Running..."
+    # The clip on top and a panel beneath it, as tall as the clip, rather than
+    # side by side. EXPORT_HEIGHT is then the two together, and there is no
+    # left half to cut out as an overlay-only video.
+    stacked: bool = False
 
     @property
     def dir(self) -> Path:
@@ -394,6 +398,39 @@ DEMOS: tuple[Demo, ...] = (
         notes="Both dancers have to be **fully in shot** for a frame to be scored, so "
               "pick a window after everyone has entered. The start of a clip usually "
               "is not one. A run that scores no frames says so rather than guessing.",
+    ),
+    Demo(
+        key="basketball",
+        crop_hint="Crop to the shooting: from just before the first shot to "
+                  "just after the last one lands.",
+        title="Basketball",
+        tagline="Calls every shot a make or a miss, plots each one on a court "
+                "from above with the FG%, and graphs the shooting elbow.",
+        model="usyd-community/vitpose-plus-large + facebook/sam3.1",
+        explainer="how-it-works.md",
+        stages=waiting.BASKETBALL_STAGES,
+        input_key="INPUT",
+        stacked=True,
+        knobs=(
+            Knob("PLAYER_HEIGHT_M", "number", "Shooter's height (m)", default=1.75,
+                 minimum=1.2, maximum=2.3, step=0.01, optional=True,
+                 info="The ruler for the court: every distance on the shot chart "
+                      "scales with it, and so does which shots count as threes."),
+            Knob("THREE_POINT_RADIUS_M", "dropdown", "Three-point line",
+                 default=6.75, optional=True,
+                 choices=(("FIBA, NCAA, WNBA (6.75 m)", 6.75), ("NBA (7.24 m)", 7.24),
+                          ("US high school (6.02 m)", 6.02)),
+                 info="Where the arc is drawn on the shot chart, and which shots "
+                      "are threes."),
+        ),
+        fixed={
+            # The author's own handles, which would otherwise be stamped in the
+            # corner of a stranger's session if they were ever set upstream.
+            "CREDIT": [],
+        },
+        notes="Film **landscape, on the 1x lens, with the phone set down and still**, "
+              "the hoop and the shooter both in shot. The hoop is found once, so a "
+              "camera that moves loses it. The elbow is only graded on side-on shots.",
     ),
 )
 
@@ -701,11 +738,9 @@ def _sweep_cache(cache_dir: Path, limit: int = CACHE_MAX_BYTES) -> None:
 def _redact(line: str, key: str) -> str:
     """*line* with no part of *key* left in it.
 
-    The pipelines print the last four characters of the key they loaded, as
-    a check that the right one was picked up. On the terminal that is the
-    user's own business; in a web page it is not something to show, so the
-    app masks it on the way through rather than editing the pipelines. The
-    anonymous tier's public key is left alone: it is not a secret.
+    The pipelines print where the key was loaded, never the key. This still
+    masks the whole key, and a trailing fragment of it, in case a line echoes
+    one. The anonymous tier's public key is left alone: it is not a secret.
     """
     if not key or key == ANON_KEY:
         return line
@@ -1236,11 +1271,20 @@ def run_demo(demo: Demo, uploads, api_key: str, start: float, seconds: float,
         _stamp_by_content(path)
 
     # ── config overrides ─────────────────────────────────────────────────────
+    # 0 is "full resolution", which the pipelines spell None.
+    export_h = int(export_height) or None
+    if demo.stacked:
+        # The dropdown names the clip's height, and the panel below is as tall
+        # again. Full resolution is the source's own height twice over; the
+        # pipeline never scales the clip past its source, so a guess too high
+        # is harmless.
+        size = _source_size(staged[0])
+        export_h = 2 * (export_h or (size[1] if size else 4320))
+
     overrides: dict = {
         "TRIM_SECONDS": seconds,
         "INFERENCE_HEIGHT": INFERENCE_HEIGHT,
-        # 0 is "full resolution", which the pipelines spell None.
-        "EXPORT_HEIGHT": int(export_height) or None,
+        "EXPORT_HEIGHT": export_h,
         "OUTPUT_DIR": str(out_dir),
         # Shared across runs on purpose: the cache key covers the clip and every
         # request field, so a repeat of the same upload and settings costs no
@@ -1419,8 +1463,8 @@ def run_demo(demo: Demo, uploads, api_key: str, start: float, seconds: float,
     ) if p]
 
     # Not for climbing's `_route` render: that one is already the right panel alone.
-    overlays = [o for v in videos if not v.stem.endswith("_route")
-                if (o := _overlay_only(v))]
+    overlays = [] if demo.stacked else [
+        o for v in videos if not v.stem.endswith("_route") if (o := _overlay_only(v))]
 
     # Concentric time, set by set and rep by rep. Ahead of the pipelines' own
     # plots: with more than one set it is the one figure that spans them all.
@@ -1631,8 +1675,10 @@ def _build_one(knob: Knob):
     if knob.kind == "checkbox":
         return gr.Checkbox(value=bool(knob.default), **common)
     if knob.kind == "number":
-        return gr.Number(value=knob.default, precision=0, minimum=knob.minimum,
-                         maximum=knob.maximum, **common)
+        whole = float(knob.step).is_integer()
+        return gr.Number(value=knob.default, precision=0 if whole else None,
+                         step=knob.step, minimum=knob.minimum, maximum=knob.maximum,
+                         **common)
     return gr.Textbox(value=knob.default or "", **common)
 
 

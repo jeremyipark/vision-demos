@@ -65,7 +65,7 @@ class CourtView:
 
     def _draw(self, img, r3, ft, depth, line, floor, paint) -> None:
         s = self.scale
-        t = max(1, int(round(s * 0.06)))
+        t = max(1, int(round(s * 0.063)))
         a = self.px(-COURT_HALF_WIDTH, BASELINE_Y)
         b = self.px(COURT_HALF_WIDTH, depth)
         cv2.rectangle(img, a, b, floor, -1)

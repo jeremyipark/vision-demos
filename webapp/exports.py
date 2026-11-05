@@ -343,7 +343,52 @@ def _dance_sync(run_dir: Path) -> Export:
     ], summary, frames, summary_label="Per pair")
 
 
+def _basketball(run_dir: Path) -> Export:
+    data = next((d for p in _find(run_dir, "shots.json") if (d := _load(p))), None)
+    if not data:
+        return Export()
+    shots = data.get("shots") or []
+    summary = []
+    for s in shots:
+        x, y = s.get("court_xy_m") or (None, None)
+        summary.append({
+            "shot": s.get("shot"),
+            "result": s.get("result", ""),
+            "reason": s.get("reason", ""),
+            "motion_starts_s": _num(s.get("motion_s")),
+            "release_s": _num(s.get("release_s")),
+            "side_on": "yes" if s.get("side_on") else "no",
+            "elbow_set_deg": _num(s.get("elbow_set_deg"), 1),
+            "elbow_release_deg": _num(s.get("elbow_release_deg"), 1),
+            "court_x_m": _num(x, 2),
+            "court_y_m": _num(y, 2),
+            "distance_ft": _num(s.get("distance_ft"), 1),
+        })
+
+    # The pipeline already writes the per-frame table; this only re-reads it.
+    frames = []
+    for path in _find(run_dir, "*_frames.csv")[:1]:
+        with path.open(newline="") as handle:
+            frames = list(csv.DictReader(handle))
+
+    made, attempts = data.get("made", 0), data.get("attempts", len(shots))
+    highlights = [("Made", f"{made} of {attempts}")]
+    if attempts:
+        highlights.append(("FG", f"{made / attempts:.0%}"))
+    longest = max((s["distance_ft"] for s in shots
+                   if s.get("result") == "make" and s.get("distance_ft") is not None),
+                  default=None)
+    if longest is not None:
+        highlights.append(("Longest make", f"{longest:.0f} ft"))
+    elbows = [s["elbow_release_deg"] for s in shots if s.get("elbow_release_deg") is not None]
+    if elbows:
+        highlights.append(("Elbow at release",
+                           f"{sum(elbows) / len(elbows):.0f}° ({len(elbows)} side-on)"))
+    return Export(highlights, summary, frames, summary_label="Per shot")
+
+
 BUILDERS = {
+    "basketball": _basketball,
     "pull_ups": _pull_ups,
     "chin_ups": _chin_ups,
     "deadlift": _deadlift,

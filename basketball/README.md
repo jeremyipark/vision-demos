@@ -12,7 +12,11 @@ the hoop and ball on [`sam3.1`](https://vlm.run/gateway/models/facebook-sam3.1),
 both through the [VLM Run Gateway](https://www.vlm.run/gateway). How it works:
 [how-it-works.md](how-it-works.md).
 
-![The 10th shot just after release, with pose, ball and rim overlay; below, the shot chart with 7 of 9 field goals and 78% in its corner](readme_images/basketball_demo_thumbnail.jpg)
+<p align="center">
+  <a href="https://www.youtube.com/shorts/TgUP5C8-8NE"><img src="https://img.youtube.com/vi/TgUP5C8-8NE/maxresdefault.jpg" width="600" alt="The 10th shot just after release, with pose, ball and rim overlay; below, the shot chart with 7 of 9 field goals and 78% in its corner. Click to watch on YouTube."></a>
+  <br>
+  <a href="https://www.youtube.com/shorts/TgUP5C8-8NE">▶ Watch on YouTube</a>
+</p>
 
 ## Run it
 
@@ -40,7 +44,7 @@ both through the [VLM Run Gateway](https://www.vlm.run/gateway). How it works:
 
    | flag | sets |
    |---|---|
-   | `--height 1080` | the output's total height; the clip and the court below each take half |
+   | `--height 1080` | the output's total height; the clip and the court below each take half, up to the source's own resolution |
    | `--hand right` | the shooting hand (default: auto) |
    | `--player-height 1.75` | the shooter's height in meters; scales court distances |
    | `--fov 70` | the camera's horizontal field of view |
@@ -54,7 +58,7 @@ both through the [VLM Run Gateway](https://www.vlm.run/gateway). How it works:
 
 ## Output
 
-Each run writes to `data/output/<timestamp>/`:
+Each run writes to `data/output/<timestamp>-shot-chart/`:
 
 | file | what |
 |---|---|
@@ -66,6 +70,33 @@ Each run writes to `data/output/<timestamp>/`:
 | `shots.json`, `run.json` | per-shot results with ball paths; settings and cost |
 
 Model replies are cached in `data/cache/`, so re-runs don't call the models again.
+
+## Helper scripts
+
+Optional extras, run from this directory on the clips in `data/input/` (they reuse
+`main.py`'s cached replies; add `--cached-only` to skip the gateway).
+
+- `python history.py`: charts and CSVs across all your sessions.
+- `python highlights.py`: a highlight reel of every shot, misses first.
+- `python social.py`: a shareable video of a session's shots.
+- `python compilation.py`: a mixed reel of swishes, rim-then-ins and misses.
+- `python rim.py`: swish, or where the ball hit the rim.
+- `python trajectory.py`: ball arcs, makes vs misses.
+- `python form.py`: elbow and knee form, makes vs misses.
+
+`social.py` writes to `data/output/<timestamp>-swish-detection/`; the others to
+`data/output/<script>/`. Each script's docstring lists its flags.
+
+### Swish detection
+
+`social.py` also makes a shareable video of a session's shots, with the clip on top
+and **Shot pathway** and **Shot outcome** panels below. Each shot's ball path is drawn
+at the hoop and marked where it met the rim; shots are tallied as swish, make with
+rim, or miss.
+
+<p align="center">
+  <img src="readme_images/swish_detection_thumbnail.jpg" width="400" alt="The 7th shot just after release, with pose and ball overlay; below, ball paths at the hoop and bars for 2 swishes, 2 makes with rim and 2 misses">
+</p>
 
 ## License
 

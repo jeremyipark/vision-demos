@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── 1. Key ───────────────────────────────────────────────────────────────
     rule(1, "API key")
     api_key, source = load_api_key(cfg.PROJECT_DIR)
-    console.print(f"  loaded from [green]{source}[/] ([dim]…{api_key[-4:]}[/])")
+    console.print(f"  loaded from [green]{source}[/]")
 
     # ── 2. Source ────────────────────────────────────────────────────────────
     rule(2, "Source video")

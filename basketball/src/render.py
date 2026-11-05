@@ -115,28 +115,124 @@ def _rim_heats(shots, streak: np.ndarray, fps: float, cfg) -> np.ndarray:
     return heat
 
 
-def render(info, *, kp: np.ndarray, hoop, track, shots, dst: Path, cfg, console) -> dict:
-    """Write the overlaid clip with the panel beneath it."""
-    video_h = min(int(cfg.EXPORT_HEIGHT) // 2, info.height) // 2 * 2
-    sx = video_h / info.height
-    width = int(round(info.width * sx / 2)) * 2
+def draw_rim(frame, center, axes, thick: int, made: bool | None) -> None:
+    """The rim as a thin orange ellipse; *made* True or False lights it, thicker, green or red."""
+    color = _bgr(RIM) if made is None else _bgr(MAKE if made else MISS)
+    cv2.ellipse(frame, (int(center[0]), int(center[1])), (max(2, int(axes[0])), max(2, int(axes[1]))),
+                0, 0, 360, color, max(2, thick if made is not None else thick // 2 + 1), cv2.LINE_AA)
+
+
+def draw_ball(frame, path, at, lo: int, k: int, r: int, thick: int) -> None:
+    """The ball as an orange ring, with a comet tail along *path* (``(frame, x, y)`` in output
+    pixels, frames *lo* to *k*): dim and thin at its oldest, full at the ball."""
+    for (f0, x0, y0), (f1, x1, y1) in zip(path, path[1:]):
+        if f1 - f0 > 6:
+            continue
+        fade = 0.25 + 0.75 * (f1 - lo) / max(1, k - lo)
+        color = tuple(int(c * fade) for c in _bgr(BALL))
+        cv2.line(frame, (int(x0), int(y0)), (int(x1), int(y1)), color,
+                 max(1, int(thick * fade)), cv2.LINE_AA)
+    c = (int(at[0]), int(at[1]))
+    cv2.circle(frame, c, r + 2, (20, 22, 26), 1, cv2.LINE_AA)
+    cv2.circle(frame, c, r, _bgr(BALL), max(2, thick - 1), cv2.LINE_AA)
+
+
+class ClipOverlay:
+    """Everything the shot chart video draws over the clip, frame by frame: the pose, the rim
+    (lit green or red on a verdict, glowing on a hot streak) and the ball with its comet tail
+    (on fire on a streak). Shared, so every video that shows a clip draws it the same.
+    *hot* False leaves the streak out: for a compilation, whose shots aren't in a row."""
+
+    def __init__(self, *, kp, hoop, track, shots, n_frames: int, fps: float, sx: float, width: int, cfg,
+                 hot: bool = True):
+        self.kp, self.shots, self.fps, self.sx, self.cfg = kp, shots, fps, sx, cfg
+        scale = width / 720
+        self.thick = max(1, round(cfg.LINE_THICKNESS * scale))
+        self.radius = max(1, round(cfg.POINT_RADIUS * scale))
+        self.flash = int(cfg.VERDICT_SECONDS * fps)
+        self.trail = int(cfg.BALL_TRAIL_SECONDS * fps)
+        # The rim as an ellipse, in output pixels.
+        self.rim_c = (int(hoop.cx * sx), int(hoop.cy * sx))
+        self.rim_ax = (max(2, int(hoop.width * sx / 2)), max(2, int((hoop.cy - hoop.top) * sx)))
+        self.streak = streaks(shots, n_frames) if hot else np.zeros(n_frames, int)
+        self.bx, self.by = smoothed(track, max_gap=int(cfg.BALL_FILL_SECONDS * fps))
+        self.ball_r = max(3, int(track.diameter * sx / 2)) if np.isfinite(track.diameter) else 6
+        self.rim_heat = _rim_heats(shots, self.streak, fps, cfg)
+        self.rng = np.random.default_rng(0)   # the flames' flicker, the same every run
+
+    def draw(self, frame, k: int) -> bool:
+        """Draw frame *k*'s overlay onto *frame*; whether the ball was drawn."""
+        shots, fps, sx, cfg, thick = self.shots, self.fps, self.sx, self.cfg, self.thick
+        bx, by, rng = self.bx, self.by, self.rng
+        active = next((s for s in shots if s.start - fps <= k <= (s.decided or s.end) + self.flash), None)
+
+        pts = self.kp[k] * sx
+        if np.isfinite(pts).any():
+            _draw_skeleton(frame, pts, colors=cfg.SKELETON_COLORS, thick=thick, radius=self.radius)
+
+        # On a streak the rim flares on each make, then cools to a warm glow.
+        if self.rim_heat[k] > 0:
+            _rim_heat(frame, self.rim_c, self.rim_ax, thick, float(self.rim_heat[k]), rng)
+
+        # The rim, lit green or red once a shot is decided, for VERDICT_SECONDS.
+        verdict = next((s for s in shots if s.decided is not None
+                        and s.decided <= k < s.decided + self.flash), None)
+        draw_rim(frame, self.rim_c, self.rim_ax, thick, None if verdict is None else verdict.made)
+
+        # The ball and its path through the whole shooting motion; on fire when shot on a streak.
+        first = None if active is None else active.start if active.motion is None else active.motion
+        if active is None or k < first or not np.isfinite(bx[k]):
+            return False
+        hot = self.streak[max(0, active.start - 1)] - cfg.HOT_STREAK + 1
+        lo = max(active.start - int(fps), k - self.trail)
+        path = [(f, bx[f] * sx, by[f] * sx) for f in range(lo, k + 1) if np.isfinite(bx[f]) and f >= first]
+        r = self.ball_r
+        if hot > 0:
+            # On fire from the release, fading out once it drops through the rim.
+            out = active.crossing if active.crossing is not None else active.decided
+            fade = 1.0 if out is None or k <= out else max(
+                0.0, 1 - (k - out) / (cfg.BALL_FIRE_FADE_SECONDS * fps))
+            flame = [p for p in path if p[0] >= max(active.release, k - int(cfg.BALL_FIRE_SECONDS * fps))]
+            if fade > 0 and len(flame) >= 2:
+                _ball_fire(frame, flame, r, hot, fade, rng)
+            path = []
+        draw_ball(frame, path, (bx[k] * sx, by[k] * sx), lo, k, r, thick)
+        return True
+
+
+def frame_size(info, canvas, cfg) -> tuple[int, int, int]:
+    """``(width, total height, clip height)`` of the export for a clip."""
+    canvas = canvas or info
+    video_h = min(int(cfg.EXPORT_HEIGHT) // 2, canvas.height) // 2 * 2
+    return int(round(canvas.width * video_h / canvas.height / 2)) * 2, 2 * video_h, video_h
+
+
+def render(info, *, kp: np.ndarray, hoop, track, shots, dst: Path | None, cfg, console,
+           canvas=None, frames: range | None = None, panel: Panel | None = None,
+           offset: int = 0, writer=None) -> dict:
+    """Write the overlaid clip with the panel beneath it.
+
+    ``canvas`` is the clip drawn on: by default the one analyzed (``info``), or a
+    taller copy of the source, so a big export isn't upscaled.
+
+    A compilation draws only part of a clip onto a video it shares with others:
+    ``frames`` are the clip's frames to draw, ``panel`` the one panel they all share,
+    ``offset`` the panel's own frame count when the first of them is drawn, and
+    ``writer`` the video they are written to (left open; ``dst`` is then unused).
+    """
+    canvas = canvas or info
+    video_h = min(int(cfg.EXPORT_HEIGHT) // 2, canvas.height) // 2 * 2
+    sx = video_h / info.height   # analyzed pixels to output pixels
+    width = int(round(canvas.width * video_h / canvas.height / 2)) * 2
     out_h = 2 * video_h   # the panel is as tall as the clip
     footer = int(round(cfg.CREDIT_FOOTER * width / 1280 / 2)) * 2 if credit_lines(cfg) else 0
-    panel = Panel(shots, info.fps, width, out_h - video_h, cfg=cfg, footer=footer)
+    panel = panel or Panel(shots, info.fps, width, out_h - video_h, cfg=cfg, footer=footer)
+    frames = range(info.n_frames) if frames is None else frames
 
-    scale = width / 720
-    thick = max(1, round(cfg.LINE_THICKNESS * scale))
-    radius = max(1, round(cfg.POINT_RADIUS * scale))
+    overlay = ClipOverlay(kp=kp, hoop=hoop, track=track, shots=shots, n_frames=info.n_frames,
+                          fps=info.fps, sx=sx, width=width, cfg=cfg)
     fps = info.fps
-    flash = int(cfg.VERDICT_SECONDS * fps)
-    trail = int(cfg.BALL_TRAIL_SECONDS * fps)
-
-    # The rim as an ellipse, in output pixels.
-    rim_c = (int(hoop.cx * sx), int(hoop.cy * sx))
-    rim_ax = (max(2, int(hoop.width * sx / 2)), max(2, int((hoop.cy - hoop.top) * sx)))
-    streak = streaks(shots, info.n_frames)
-    bx, by = smoothed(track, max_gap=int(cfg.BALL_FILL_SECONDS * fps))
-    ball_r = max(3, int(track.diameter * sx / 2)) if np.isfinite(track.diameter) else 6
+    bx, by, ball_r = overlay.bx, overlay.by, overlay.ball_r
     # The streak text fades while the ball passes behind it, easing over a few frames.
     x0, y0, x1, y1 = panel.streak_box(width)
     with np.errstate(invalid="ignore"):
@@ -145,72 +241,31 @@ def render(info, *, kp: np.ndarray, hoop, track, shots, dst: Path, cfg, console)
     near = (np.abs(np.arange(info.n_frames)[:, None] - under[None]).min(axis=1)
             if len(under) else np.full(info.n_frames, 99))
     streak_alpha = cfg.STREAK_FADE + (1 - cfg.STREAK_FADE) * np.clip((near - 1) / 4, 0, 1)
-    rim_heat = _rim_heats(shots, streak, fps, cfg)
-    rng = np.random.default_rng(0)   # the flames' flicker, the same every run
 
-    cap = cv2.VideoCapture(str(info.path))
-    writer = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, out_h))
+    cap = cv2.VideoCapture(str(canvas.path))
+    if frames.start:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frames.start)
+    own_writer = writer is None
+    if own_writer:
+        writer = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, out_h))
     ball_frames = 0
     with Progress(*_PROGRESS_COLUMNS, console=console, transient=True) as progress:
-        task = progress.add_task("render", total=info.n_frames)
-        for k in range(info.n_frames):
+        task = progress.add_task("render", total=len(frames))
+        for done, k in enumerate(frames):
             ok, src = cap.read()
             if not ok:
                 break
             frame = cv2.resize(src, (width, video_h), interpolation=cv2.INTER_AREA)
-            active = next((s for s in shots if s.start - fps <= k <= (s.decided or s.end) + flash),
-                          None)
+            ball_frames += overlay.draw(frame, k)
 
-            pts = kp[k] * sx
-            if np.isfinite(pts).any():
-                _draw_skeleton(frame, pts, colors=cfg.SKELETON_COLORS, thick=thick, radius=radius)
-
-            # On a streak the rim flares on each make, then cools to a warm glow.
-            if rim_heat[k] > 0:
-                _rim_heat(frame, rim_c, rim_ax, thick, float(rim_heat[k]), rng)
-
-            # The rim, lit green or red once a shot is decided, for VERDICT_SECONDS.
-            verdict = next((s for s in shots if s.decided is not None
-                            and s.decided <= k < s.decided + flash), None)
-            rim_color = (_bgr(MAKE if verdict.made else MISS) if verdict is not None else _bgr(RIM))
-            cv2.ellipse(frame, rim_c, rim_ax, 0, 0, 360, rim_color,
-                        max(2, thick if verdict is not None else thick // 2 + 1), cv2.LINE_AA)
-
-            # The ball and its path through the whole shooting motion; on fire when shot on a streak.
-            first = None if active is None else active.start if active.motion is None else active.motion
-            if active is not None and k >= first and np.isfinite(bx[k]):
-                ball_frames += 1
-                hot = streak[max(0, active.start - 1)] - cfg.HOT_STREAK + 1
-                lo = max(active.start - int(fps), k - trail)
-                path = [(f, bx[f] * sx, by[f] * sx) for f in range(lo, k + 1)
-                        if np.isfinite(bx[f]) and f >= first]
-                r = ball_r
-                if hot > 0:
-                    # On fire from the release, fading out once it drops through the rim.
-                    out = active.crossing if active.crossing is not None else active.decided
-                    fade = 1.0 if out is None or k <= out else max(
-                        0.0, 1 - (k - out) / (cfg.BALL_FIRE_FADE_SECONDS * fps))
-                    flame = [p for p in path if p[0] >= max(active.release, k - int(cfg.BALL_FIRE_SECONDS * fps))]
-                    if fade > 0 and len(flame) >= 2:
-                        _ball_fire(frame, flame, r, hot, fade, rng)
-                    path = []
-                for (f0, x0, y0), (f1, x1, y1) in zip(path, path[1:]):
-                    if f1 - f0 > 6:
-                        continue
-                    fade = 0.25 + 0.75 * (f1 - lo) / max(1, k - lo)
-                    color = tuple(int(c * fade) for c in _bgr(BALL))
-                    cv2.line(frame, (int(x0), int(y0)), (int(x1), int(y1)), color,
-                             max(1, int(thick * fade)), cv2.LINE_AA)
-                c = (int(bx[k] * sx), int(by[k] * sx))
-                cv2.circle(frame, c, r + 2, (20, 22, 26), 1, cv2.LINE_AA)
-                cv2.circle(frame, c, r, _bgr(BALL), max(2, thick - 1), cv2.LINE_AA)
-
-            panel.streak(frame, k, streak_alpha[k])
-            out = np.vstack([frame, panel.render(k)])
+            pk = offset + done   # the panel's own frame count: it is the clip's, unless compiled
+            panel.streak(frame, pk, streak_alpha[k])
+            out = np.vstack([frame, panel.render(pk)])
             writer.write(out)
-            progress.update(task, completed=k + 1)
+            progress.update(task, completed=done + 1)
     cap.release()
-    writer.release()
+    if own_writer:
+        writer.release()
     return {"width": width, "height": out_h, "video_height": video_h,
             "ball_frames_drawn": ball_frames}
 
@@ -270,6 +325,7 @@ def plot_summary(shots, fps: float, hoop, frame_bgr: np.ndarray, dst: Path, *, c
     for shot, p in zip(shots, spots):
         if p is None:
             continue
+        p = (int(round(p[0])), int(round(p[1])))   # OpenCV 5 refuses numpy/float points
         cv2.circle(img, p, 14, _bgr(MAKE if shot.made else MISS), -1, cv2.LINE_AA)
         cv2.putText(img, str(shot.number), (p[0] - 6 * len(str(shot.number)), p[1] + 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 22, 26), 2, cv2.LINE_AA)

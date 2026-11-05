@@ -60,7 +60,9 @@ Real-world computer vision demos.
 ### Basketball
 
 <p align="center">
-  <a href="basketball/"><img src="basketball/readme_images/basketball_demo_thumbnail.jpg" width="600" alt="The 10th shot just after release, with pose, ball and rim overlay; below, the shot chart with 7 of 9 field goals and 78% in its corner"></a>
+  <a href="https://www.youtube.com/shorts/TgUP5C8-8NE"><img src="https://img.youtube.com/vi/TgUP5C8-8NE/maxresdefault.jpg" width="600" alt="The 10th shot just after release, with pose, ball and rim overlay; below, the shot chart with 7 of 9 field goals and 78% in its corner. Click to watch on YouTube."></a>
+  <br>
+  <a href="https://www.youtube.com/shorts/TgUP5C8-8NE">▶ Watch on YouTube</a>
 </p>
 
 ### Running
@@ -86,7 +88,7 @@ conda env create -f environment.yml && conda activate vision-demos   # or: pip i
 python app.py                                                        # -> http://127.0.0.1:7860
 ```
 
-Upload a clip, trim it, analyze. No API key needed (anonymous, rate-limited tier); paste a [VLM Run](https://app.vlm.run) key or set `VLMRUN_API_KEY` for higher limits. `rock_climbing_3d` isn't in the app (it needs a LiDAR capture). `push_ups` and `basketball` aren't in the app either. ffmpeg is required.
+Upload a clip, trim it, analyze. No API key needed (anonymous, rate-limited tier); paste a [VLM Run](https://app.vlm.run) key or set `VLMRUN_API_KEY` for higher limits. `rock_climbing_3d` (it needs a LiDAR capture) and `push_ups` aren't in the app. ffmpeg is required.
 
 ## License
 
