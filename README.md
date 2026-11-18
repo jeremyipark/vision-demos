@@ -13,6 +13,7 @@ Real-world computer vision demos.
 | **[running](running/)** | Measures a runner's cadence, times every foot strike, and averages the knee shape at contact. | [`vitpose-plus-large`](https://vlm.run/gateway/models/usyd-community-vitpose-plus-large) |
 | **[deadlift](deadlift/)** | Counts deadlift reps and classifies each rep's back as straight or rounded, with the probability. | [`sam3.1`](https://vlm.run/gateway/models/facebook-sam3.1) + [`vitpose-plus-large`](https://vlm.run/gateway/models/usyd-community-vitpose-plus-large) + [`gemma-4-26b-a4b-it`](https://vlm.run/gateway/models/google-gemma-4-26b-a4b-it) |
 | **[basketball](basketball/)** | Calls every shot a make or a miss by following the ball through the rim, and plots each shot on a court from above with the FG%. | [`sam3.1`](https://vlm.run/gateway/models/facebook-sam3.1) + [`vitpose-plus-large`](https://vlm.run/gateway/models/usyd-community-vitpose-plus-large) |
+| **[golf](golf/)** | Breaks down one golf swing filmed from behind: segments the club and traces the clubhead's path, follows the ball off the tee, follows the swing's phases on a live timeline, and times its tempo. | [`sam3.1`](https://vlm.run/gateway/models/facebook-sam3.1) + [`vitpose-plus-large`](https://vlm.run/gateway/models/usyd-community-vitpose-plus-large) |
 
 
 ### Rock Climbing 3D
@@ -65,6 +66,12 @@ Real-world computer vision demos.
   <a href="https://www.youtube.com/shorts/TgUP5C8-8NE">▶ Watch on YouTube</a>
 </p>
 
+### Golf
+
+<p align="center">
+  <a href="golf/"><img src="golf/readme_images/golf_demo_thumbnail.jpg" width="360" alt="The golfer holding the finish, with the pose overlay, the clubhead path traced in green and the ball's flight in white up to its ring; below, the live timeline in four colored phases with impact marked, and a 2.1 : 1 tempo from a 0.63 s backswing and 0.30 s downswing"></a>
+</p>
+
 ### Running
 
 <p align="center">
@@ -88,7 +95,7 @@ conda env create -f environment.yml && conda activate vision-demos   # or: pip i
 python app.py                                                        # -> http://127.0.0.1:7860
 ```
 
-Upload a clip, trim it, analyze. No API key needed (anonymous, rate-limited tier); paste a [VLM Run](https://app.vlm.run) key or set `VLMRUN_API_KEY` for higher limits. `rock_climbing_3d` (it needs a LiDAR capture) and `push_ups` aren't in the app. ffmpeg is required.
+Upload a clip, trim it, analyze. No API key needed (anonymous, rate-limited tier); paste a [VLM Run](https://app.vlm.run) key or set `VLMRUN_API_KEY` for higher limits. `rock_climbing_3d` (it needs a LiDAR capture), `push_ups` and `golf` aren't in the app. ffmpeg is required.
 
 ## License
 
